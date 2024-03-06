@@ -47,12 +47,12 @@ jobs:
           # Strip prefix from version
           VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,' | sed -e 's/^v//')
           
-          docker tag ${IMAGE}} ${REGISTRY_NAME}/${IMAGE}:${VERSION}
+          docker tag ${IMAGE} ${REGISTRY_NAME}/${IMAGE}:${VERSION}
           docker push ${REGISTRY_NAME}/${IMAGE}:${VERSION}
 
   release:
     name: Release
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     # Run only if previous job has succeeded
     needs: [push]
