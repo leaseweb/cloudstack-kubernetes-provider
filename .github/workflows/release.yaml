@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     # Run only if previous job has succeeded
-    needs: [push]
+    needs: [build-and-push]
 
     # Create a release only for tags v*
     if: startsWith(github.ref, 'refs/tags/v')
