@@ -1,7 +1,5 @@
 # Leaseweb Cloudstck Cloud Controller Manager Hem Charts
- [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Releases downloads](https://img.shields.io/github/downloads/Leaseweb/cloudstack-kubernetes-provider/total.svg)](https://github.com/Leaseweb/cloudstack-kubernetes-provider/releases)
-
- <!-- ![Release Charts](https://github.com/Leaseweb/cloudstack-kubernetes-provider/actions/workflows/charts-release.yaml/badge.svg?branch=main) -->
+ [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Releases downloads](https://img.shields.io/github/downloads/Leaseweb/cloudstack-kubernetes-provider/total.svg)](https://github.com/Leaseweb/cloudstack-kubernetes-provider/releases)![Release Charts](https://github.com/Leaseweb/cloudstack-kubernetes-provider/actions/workflows/charts-release.yaml/badge.svg?branch=main)
 
 This functionality is in beta and is subject to change. The code is provided as-is with no warranties. Beta features are not subject to the support SLA of official GA features.
 
@@ -29,5 +27,5 @@ Once Helm is set up properly, add the repository as follows:
 [Apache 2.0 License](https://github.com/Leaseweb/cloudstack-kubernetes-provider/blob/master/LICENSE).
 
 ## Helm charts build status
-<!-- 
-![Release Charts](https://github.com/Leaseweb/cloudstack-kubernetes-provider/actions/workflows/charts-release.yaml/badge.svg?branch=main) -->
+
+![Release Charts](https://github.com/Leaseweb/cloudstack-kubernetes-provider/actions/workflows/charts-release.yaml/badge.svg?branch=main)
