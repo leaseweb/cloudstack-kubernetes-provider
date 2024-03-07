@@ -1,54 +1,45 @@
-name: Release
+name: Release and Image Push
 
 on:
   push:
     branches:
-      - master
+      - main
     tags:
       - v*
 
 env:
   REGISTRY_NAME: ghcr.io/leaseweb
-  IMAGE: "cloud-controller-manager"
+  IMAGE_NAME: "cloud-controller-manager"
 
 jobs:
-  push:
-    name: Push images
+  build-and-push:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
 
       - name: Log into registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{github.actor}}
-          password: ${{secrets.GITHUB_TOKEN}}
+          registry: ${{ env.REGISTRY_NAME }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push master
-        if: github.ref == 'refs/heads/master'
+      - name: Build and Push Docker Image (Main Branch)
+        if: github.ref == 'refs/heads/main'
         run: |
-            docker tag ${IMAGE} ${REGISTRY_NAME}/${IMAGE}:master
-            docker push ${REGISTRY_NAME}/${IMAGE}:master
+          docker build . -t ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:main
+          docker push ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:main
 
-      - name: Push tagged release
+      - name: Build and Push Docker Image (Tags)
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          # Strip prefix from version
           VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,' | sed -e 's/^v//')
-          
-          docker tag ${IMAGE} ${REGISTRY_NAME}/${IMAGE}:${VERSION}
-          docker push ${REGISTRY_NAME}/${IMAGE}:${VERSION}
+          docker build . -t ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${VERSION}
+          docker push ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${VERSION}
 
   release:
     name: Release
