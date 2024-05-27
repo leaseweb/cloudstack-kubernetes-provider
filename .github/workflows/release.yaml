@@ -3,6 +3,7 @@ name: Release and Image Push
 on:
   push:
     branches:
+      - develop
       - main
     tags:
       - v*
@@ -27,6 +28,12 @@ jobs:
           registry: ${{ env.REGISTRY_NAME }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image (Develop Branch)
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          docker build . -t ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:develop
+          docker push ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:develop
 
       - name: Build and Push Docker Image (Main Branch)
         if: github.ref == 'refs/heads/main'
