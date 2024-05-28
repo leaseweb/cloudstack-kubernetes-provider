@@ -43,7 +43,13 @@ const (
 	// CloudStack >= 4.6 is required for it to work.
 	ServiceAnnotationLoadBalancerProxyProtocol = "service.beta.kubernetes.io/cloudstack-load-balancer-proxy-protocol"
 
+	// ServiceAnnotationLoadBalancerLoadbalancerHostname can be used in conjunction
+	// with PROXY protocol to allow the service to be accessible from inside the
+	// cluster. This is a workaround for https://github.com/kubernetes/kubernetes/issues/66607
 	ServiceAnnotationLoadBalancerLoadbalancerHostname = "service.beta.kubernetes.io/cloudstack-load-balancer-hostname"
+
+	// ServiceAnnotationLoadBalancerAddress is a read-only annotation indicating the IP address assigned to the load balancer.
+	ServiceAnnotationLoadBalancerAddress = "service.beta.kubernetes.io/cloudstack-load-balancer-address"
 )
 
 type loadBalancer struct {
@@ -90,6 +96,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		return nil, errors.New("requested load balancer with no ports")
 	}
 
+	// Patch the service with new/updated annotations if needed after EnsureLoadBalancer finishes.
+	patcher := newServicePatcher(cs.kclient, service)
+	defer func() { err = patcher.Patch(ctx, err) }()
+
 	// Get the load balancer details and existing rules.
 	lb, err := cs.getLoadBalancer(ctx, service)
 	if err != nil {
@@ -130,6 +140,9 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	klog.V(4).Infof("Load balancer %v is associated with IP %v", lb.name, lb.ipAddr)
+
+	// Set the load balancer IP address annotation on the Service
+	setServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, lb.ipAddr)
 
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
@@ -378,6 +391,7 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 
 	p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
 	p.SetListall(true)
+	p.SetDetails([]string{"min", "nics"})
 
 	if cs.projectID != "" {
 		p.SetProjectid(cs.projectID)
@@ -878,4 +892,12 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	klog.V(4).Infof("Could not find a Service Annotation; falling back to default setting: %v = %v", annotationKey, defaultSetting)
 
 	return defaultSetting
+}
+
+// setServiceAnnotation is used to create/set or update an annotation on the Service object
+func setServiceAnnotation(service *corev1.Service, key, value string) {
+	if service.ObjectMeta.Annotations == nil {
+		service.ObjectMeta.Annotations = map[string]string{}
+	}
+	service.ObjectMeta.Annotations[key] = value
 }

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	"gopkg.in/gcfg.v1"
@@ -53,6 +54,7 @@ type CSCloud struct {
 	client    *cloudstack.CloudStackClient
 	projectID string // If non-"", all resources will be created within this project
 	zone      string
+	kclient   kubernetes.Interface
 }
 
 func init() {
@@ -100,6 +102,8 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 
 // Initialize passes a Kubernetes clientBuilder interface to the cloud provider.
 func (cs *CSCloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
+	clientset := clientBuilder.ClientOrDie("cloud-controller-manager")
+	cs.kclient = clientset
 }
 
 // LoadBalancer returns an implementation of LoadBalancer for CloudStack.
