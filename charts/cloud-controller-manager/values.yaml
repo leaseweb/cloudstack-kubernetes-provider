@@ -79,6 +79,11 @@ tolerations:
   - key: "node.kubernetes.io/not-ready"
     effect: "NoExecute"
 
+## Set custom affinity rules to the Cloud Controller Manaegr instance
+## ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
+##
+affinity: {}
+
 # Set security settings for the controller pods
 # For all available options, see https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.23/#podsecuritycontext-v1-core
 podSecurityContext:
