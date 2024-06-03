@@ -40,6 +40,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if gt (len .Values.nodeSelector) 0 }}
       nodeSelector: 
         {{ toYaml .Values.nodeSelector | nindent 8 }}
