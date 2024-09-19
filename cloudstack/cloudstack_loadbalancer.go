@@ -447,6 +447,10 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
 	for _, vm := range l.VirtualMachines {
 		if hostNames[strings.ToLower(vm.Name)] {
+			if len(vm.Nic) == 0 {
+				// Skip VM's without any active network interfaces. This happens during rollout f.e.
+				continue
+			}
 			if networkID != "" && networkID != vm.Nic[0].Networkid {
 				return nil, "", errors.New("found hosts that belong to different networks")
 			}
