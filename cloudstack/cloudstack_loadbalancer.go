@@ -98,6 +98,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 // EnsureLoadBalancer creates a new load balancer, or updates the existing one. Returns the status of the balancer.
 func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) {
 	klog.V(4).InfoS("EnsureLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
+	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
 	if len(service.Spec.Ports) == 0 {
 		return nil, errors.New("requested load balancer with no ports")
@@ -136,6 +137,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
 			return nil, err
 		}
+
+		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
+		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
+		klog.Info(msg)
 
 		if lb.ipAddr != "" && lb.ipAddr != service.Spec.LoadBalancerIP {
 			defer func(lb *loadBalancer) {
@@ -214,6 +219,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			if _, err := lb.updateFirewallRule(lbRule.Publicipid, int(port.Port), protocol, lbSourceRanges.StringSlice()); err != nil {
 				return nil, err
 			}
+		} else {
+			msg := fmt.Sprintf("LoadBalancerSourceRanges are ignored for Service %s because this CloudStack network does not support it", serviceName)
+			cs.eventRecorder.Event(service, corev1.EventTypeWarning, "LoadBalancerSourceRangesIgnored", msg)
+			klog.Warning(msg)
 		}
 	}
 

@@ -22,11 +22,14 @@ package cloudstack
 import (
 	"errors"
 	"fmt"
-	"io"
-	"k8s.io/client-go/kubernetes"
-
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	"gopkg.in/gcfg.v1"
+	"io"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 )
 
@@ -51,10 +54,11 @@ var _ cloudprovider.LoadBalancer = (*CSCloud)(nil)
 
 // CSCloud is an implementation of Interface for CloudStack.
 type CSCloud struct {
-	client    *cloudstack.CloudStackClient
-	projectID string // If non-"", all resources will be created within this project
-	zone      string
-	kclient   kubernetes.Interface
+	client        *cloudstack.CloudStackClient
+	projectID     string // If non-"", all resources will be created within this project
+	zone          string
+	kclient       kubernetes.Interface
+	eventRecorder record.EventRecorder
 }
 
 func init() {
@@ -104,6 +108,11 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 func (cs *CSCloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
 	clientset := clientBuilder.ClientOrDie("cloud-controller-manager")
 	cs.kclient = clientset
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{
+		Interface: cs.kclient.CoreV1().Events(""),
+	})
+	cs.eventRecorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "cloud-provider-cloudstack"})
 }
 
 // LoadBalancer returns an implementation of LoadBalancer for CloudStack.
