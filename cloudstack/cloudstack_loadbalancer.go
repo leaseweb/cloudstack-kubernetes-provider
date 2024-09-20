@@ -290,7 +290,7 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		if len(remove) > 0 {
-			klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", assign, lbRule.Name)
+			klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", remove, lbRule.Name)
 			if err := lb.removeHostsFromRule(lbRule, remove); err != nil {
 				return err
 			}
@@ -300,6 +300,7 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	return nil
 }
 
+// isFirewallSupported checks whether a CloudStack network supports the Firewall service.
 func isFirewallSupported(services []cloudstack.NetworkServiceInternal) bool {
 	for _, svc := range services {
 		if svc.Name == "Firewall" {
@@ -747,6 +748,10 @@ func ruleToString(rule *cloudstack.FirewallRule) string {
 }
 
 func rulesToString(rules []*cloudstack.FirewallRule) string {
+	if len(rules) == 0 {
+		return "none"
+	}
+
 	ls := &strings.Builder{}
 	first := true
 	for _, rule := range rules {
@@ -762,6 +767,10 @@ func rulesToString(rules []*cloudstack.FirewallRule) string {
 }
 
 func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
+	if len(rules) == 0 {
+		return "none"
+	}
+
 	ls := &strings.Builder{}
 	first := true
 	for rule := range rules {
@@ -790,12 +799,11 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	if lb.projectID != "" {
 		p.SetProjectid(lb.projectID)
 	}
-	klog.V(4).Infof("Listing firewall rules for %v", p)
 	r, err := lb.Firewall.ListFirewallRules(p)
 	if err != nil {
 		return false, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
 	}
-	klog.V(4).Infof("All firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
+	klog.V(4).Infof("Existing firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
 
 	// find all rules that have a matching proto+port
 	// a map may or may not be faster, but is a bit easier to understand
@@ -812,7 +820,7 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	for rule := range filtered {
 		cidrlist := strings.Split(rule.Cidrlist, ",")
 		if compareStringSlice(cidrlist, allowedCIDRs) {
-			klog.V(4).Infof("Found identical rule: %v", rule)
+			klog.V(4).Infof("Found identical rule: %v", ruleToString(rule))
 			match = rule
 
 			break
@@ -921,9 +929,9 @@ func getLoadBalancerSourceRanges(service *corev1.Service) (utilnet.IPNetSet, err
 	return ipnets, nil
 }
 
-// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting.
+// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's string value or a specified defaultSetting.
 func getStringFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting string) string {
-	klog.V(4).InfoS("getStringFromServiceAnnotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
+	klog.V(4).InfoS("Attempting to get string value from service annotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	if annotationValue, ok := service.Annotations[annotationKey]; ok {
 		// If there is an annotation for this setting, set the "setting" var to it
 		// annotationValue can be empty, it is working as designed
@@ -934,7 +942,7 @@ func getStringFromServiceAnnotation(service *corev1.Service, annotationKey strin
 	}
 	// If there is no annotation, set "settings" var to the value from cloud config
 	if defaultSetting != "" {
-		klog.V(4).Infof("Could not find a Service Annotation; falling back on cloud-config setting: %v = %v", annotationKey, defaultSetting)
+		klog.V(4).InfoS("Could not find a Service Annotation; falling back on cloud-config setting", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	}
 
 	return defaultSetting
@@ -942,7 +950,7 @@ func getStringFromServiceAnnotation(service *corev1.Service, annotationKey strin
 
 // getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's boolean value or a specified defaultSetting.
 func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting bool) bool {
-	klog.V(4).InfoS("getBoolFromServiceAnnotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
+	klog.V(4).InfoS("Attempting to get bool value from service annotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	if annotationValue, ok := service.Annotations[annotationKey]; ok {
 		var returnValue bool
 		switch annotationValue {
@@ -958,7 +966,7 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 
 		return returnValue
 	}
-	klog.V(4).Infof("Could not find a Service Annotation; falling back to default setting: %v = %v", annotationKey, defaultSetting)
+	klog.V(4).InfoS("Could not find a Service Annotation; falling back to default setting", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 
 	return defaultSetting
 }
