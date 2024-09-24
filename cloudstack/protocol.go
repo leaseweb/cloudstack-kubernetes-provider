@@ -20,7 +20,7 @@
 package cloudstack
 
 import (
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // LoadBalancerProtocol represents a specific network protocol supported by the CloudStack load balancer.
@@ -81,16 +81,16 @@ func (p LoadBalancerProtocol) IPProtocol() string {
 //	                     -> "tcp-proxy" (CloudStack 4.6 and later)
 //
 // Other values return LoadBalancerProtocolInvalid.
-func ProtocolFromServicePort(port v1.ServicePort, service *v1.Service) LoadBalancerProtocol {
+func ProtocolFromServicePort(port corev1.ServicePort, service *corev1.Service) LoadBalancerProtocol {
 	proxy := getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyProtocol, false)
 	switch port.Protocol {
-	case v1.ProtocolTCP:
+	case corev1.ProtocolTCP:
 		if proxy {
 			return LoadBalancerProtocolTCPProxy
 		} else {
 			return LoadBalancerProtocolTCP
 		}
-	case v1.ProtocolUDP:
+	case corev1.ProtocolUDP:
 		return LoadBalancerProtocolUDP
 	default:
 		return LoadBalancerProtocolInvalid

@@ -23,15 +23,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes"
-	"reflect"
 )
 
 type servicePatcher struct {
@@ -60,7 +59,7 @@ func (sp *servicePatcher) Patch(ctx context.Context, err error) error {
 }
 
 // patchService makes patch request to the Service object.
-func patchService(ctx context.Context, client kubernetes.Interface, cur, mod *v1.Service) error {
+func patchService(ctx context.Context, client kubernetes.Interface, cur, mod *corev1.Service) error {
 	curJSON, err := json.Marshal(cur)
 	if err != nil {
 		return fmt.Errorf("failed to serialize current service object: %v", err)
@@ -71,7 +70,7 @@ func patchService(ctx context.Context, client kubernetes.Interface, cur, mod *v1
 		return fmt.Errorf("failed to serialize modified service object: %v", err)
 	}
 
-	patch, err := strategicpatch.CreateTwoWayMergePatch(curJSON, modJSON, v1.Service{})
+	patch, err := strategicpatch.CreateTwoWayMergePatch(curJSON, modJSON, corev1.Service{})
 	if err != nil {
 		return fmt.Errorf("failed to create 2-way merge patch: %v", err)
 	}

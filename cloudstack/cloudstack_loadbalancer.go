@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
+	utilnet "k8s.io/utils/net"
 )
 
 const (
@@ -50,6 +51,10 @@ const (
 
 	// ServiceAnnotationLoadBalancerAddress is a read-only annotation indicating the IP address assigned to the load balancer.
 	ServiceAnnotationLoadBalancerAddress = "service.beta.kubernetes.io/cloudstack-load-balancer-address"
+
+	// Used to construct the load balancer name.
+	servicePrefix = "K8s_svc_"
+	lbNameFormat  = "%s%s_%s_%s"
 )
 
 type loadBalancer struct {
@@ -70,7 +75,9 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 	klog.V(4).InfoS("GetLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 
 	// Get the load balancer details and existing rules.
-	lb, err := cs.getLoadBalancer(ctx, service)
+	name := cs.GetLoadBalancerName(ctx, clusterName, service)
+	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
+	lb, err := cs.getLoadBalancerByName(name, legacyName)
 	if err != nil {
 		return nil, false, err
 	}
@@ -91,6 +98,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 // EnsureLoadBalancer creates a new load balancer, or updates the existing one. Returns the status of the balancer.
 func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) {
 	klog.V(4).InfoS("EnsureLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
+	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
 	if len(service.Spec.Ports) == 0 {
 		return nil, errors.New("requested load balancer with no ports")
@@ -101,7 +109,9 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	defer func() { err = patcher.Patch(ctx, err) }()
 
 	// Get the load balancer details and existing rules.
-	lb, err := cs.getLoadBalancer(ctx, service)
+	name := cs.GetLoadBalancerName(ctx, clusterName, service)
+	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
+	lb, err := cs.getLoadBalancerByName(name, legacyName)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +137,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
 			return nil, err
 		}
+
+		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
+		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
+		klog.Info(msg)
 
 		if lb.ipAddr != "" && lb.ipAddr != service.Spec.LoadBalancerIP {
 			defer func(lb *loadBalancer) {
@@ -195,11 +209,20 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, err
 		}
 
+		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
+		if err != nil {
+			return nil, err
+		}
+
 		if lbRule != nil && isFirewallSupported(network.Service) {
 			klog.V(4).Infof("Creating firewall rules for load balancer rule: %v (%v:%v:%v)", lbRuleName, protocol, lbRule.Publicip, port.Port)
-			if _, err := lb.updateFirewallRule(lbRule.Publicipid, int(port.Port), protocol, service.Spec.LoadBalancerSourceRanges); err != nil {
+			if _, err := lb.updateFirewallRule(lbRule.Publicipid, int(port.Port), protocol, lbSourceRanges.StringSlice()); err != nil {
 				return nil, err
 			}
+		} else {
+			msg := fmt.Sprintf("LoadBalancerSourceRanges are ignored for Service %s because this CloudStack network does not support it", serviceName)
+			cs.eventRecorder.Event(service, corev1.EventTypeWarning, "LoadBalancerSourceRangesIgnored", msg)
+			klog.Warning(msg)
 		}
 	}
 
@@ -244,7 +267,9 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	klog.V(4).InfoS("UpdateLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 
 	// Get the load balancer details and existing rules.
-	lb, err := cs.getLoadBalancer(ctx, service)
+	name := cs.GetLoadBalancerName(ctx, clusterName, service)
+	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
+	lb, err := cs.getLoadBalancerByName(name, legacyName)
 	if err != nil {
 		return err
 	}
@@ -274,7 +299,7 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		if len(remove) > 0 {
-			klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", assign, lbRule.Name)
+			klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", remove, lbRule.Name)
 			if err := lb.removeHostsFromRule(lbRule, remove); err != nil {
 				return err
 			}
@@ -284,6 +309,7 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	return nil
 }
 
+// isFirewallSupported checks whether a CloudStack network supports the Firewall service.
 func isFirewallSupported(services []cloudstack.NetworkServiceInternal) bool {
 	for _, svc := range services {
 		if svc.Name == "Firewall" {
@@ -300,7 +326,9 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	klog.V(4).InfoS("EnsureLoadBalancerDeleted", "cluster", clusterName, "service", klog.KObj(service))
 
 	// Get the load balancer details and existing rules.
-	lb, err := cs.getLoadBalancer(ctx, service)
+	name := cs.GetLoadBalancerName(ctx, clusterName, service)
+	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
+	lb, err := cs.getLoadBalancerByName(name, legacyName)
 	if err != nil {
 		return err
 	}
@@ -337,16 +365,21 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	return nil
 }
 
-// GetLoadBalancerName retrieves the name of the LoadBalancer.
-func (cs *CSCloud) GetLoadBalancerName(ctx context.Context, clusterName string, service *corev1.Service) string {
+// GetLoadBalancerName returns the name of the LoadBalancer.
+func (cs *CSCloud) GetLoadBalancerName(_ context.Context, clusterName string, service *corev1.Service) string {
+	return Sprintf255(lbNameFormat, servicePrefix, clusterName, service.Namespace, service.Name)
+}
+
+// getLoadBalancerLegacyName returns the legacy load balancer name for backward compatibility.
+func (cs *CSCloud) getLoadBalancerLegacyName(_ context.Context, _ string, service *corev1.Service) string {
 	return cloudprovider.DefaultLoadBalancerName(service)
 }
 
-// getLoadBalancer retrieves the IP address and ID and all the existing rules it can find.
-func (cs *CSCloud) getLoadBalancer(ctx context.Context, service *corev1.Service) (*loadBalancer, error) {
+// getLoadBalancerByName retrieves the IP address and ID and all the existing rules it can find.
+func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer, error) {
 	lb := &loadBalancer{
 		CloudStackClient: cs.client,
-		name:             cs.GetLoadBalancerName(ctx, "", service),
+		name:             name,
 		projectID:        cs.projectID,
 		rules:            make(map[string]*cloudstack.LoadBalancerRule),
 	}
@@ -364,11 +397,27 @@ func (cs *CSCloud) getLoadBalancer(ctx context.Context, service *corev1.Service)
 		return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
 	}
 
+	// If no rules were found, check the legacy name.
+	if len(l.LoadBalancerRules) == 0 {
+		if len(legacyName) > 0 {
+			p.SetKeyword(legacyName)
+			l, err = cs.client.LoadBalancer.ListLoadBalancerRules(p)
+			if err != nil {
+				return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
+			}
+			if len(l.LoadBalancerRules) > 0 {
+				lb.name = legacyName
+			}
+		} else {
+			return lb, nil
+		}
+	}
+
 	for _, lbRule := range l.LoadBalancerRules {
 		lb.rules[lbRule.Name] = lbRule
 
 		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
-			klog.Warningf("Load balancer for service %v has rules associated with different IP's: %v, %v", klog.KObj(service), lb.ipAddr, lbRule.Publicip)
+			klog.Warningf("Load balancer %v has rules associated with different IP's: %v, %v", lb.name, lb.ipAddr, lbRule.Publicip)
 		}
 
 		lb.ipAddr = lbRule.Publicip
@@ -408,6 +457,10 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
 	for _, vm := range l.VirtualMachines {
 		if hostNames[strings.ToLower(vm.Name)] {
+			if len(vm.Nic) == 0 {
+				// Skip VM's without any active network interfaces. This happens during rollout f.e.
+				continue
+			}
 			if networkID != "" && networkID != vm.Nic[0].Networkid {
 				return nil, "", errors.New("found hosts that belong to different networks")
 			}
@@ -465,7 +518,7 @@ func (lb *loadBalancer) getPublicIPAddress(loadBalancerIP string) error {
 	return nil
 }
 
-// associatePublicIPAddress associates a new IP and sets the address and it's ID.
+// associatePublicIPAddress associates a new IP and sets the address and its ID.
 func (lb *loadBalancer) associatePublicIPAddress() error {
 	klog.V(4).Infof("Allocate new IP for load balancer: %v", lb.name)
 	// If a network belongs to a VPC, the IP address needs to be associated with
@@ -704,6 +757,10 @@ func ruleToString(rule *cloudstack.FirewallRule) string {
 }
 
 func rulesToString(rules []*cloudstack.FirewallRule) string {
+	if len(rules) == 0 {
+		return "none"
+	}
+
 	ls := &strings.Builder{}
 	first := true
 	for _, rule := range rules {
@@ -719,6 +776,10 @@ func rulesToString(rules []*cloudstack.FirewallRule) string {
 }
 
 func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
+	if len(rules) == 0 {
+		return "none"
+	}
+
 	ls := &strings.Builder{}
 	first := true
 	for rule := range rules {
@@ -735,13 +796,10 @@ func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
 
 // updateFirewallRule creates a firewall rule for a load balancer rule
 //
-// If the rule list is empty, all internet (IPv4: 0.0.0.0/0) is opened for the
-// load balancer's port+protocol implicitly.
-//
 // Returns true if the firewall rule was created or updated.
-func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedIPs []string) (bool, error) {
-	if len(allowedIPs) == 0 {
-		allowedIPs = []string{defaultAllowedCIDR}
+func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
+	if len(allowedCIDRs) == 0 {
+		return false, errors.New("the allowed CIDR list cannot be empty")
 	}
 
 	p := lb.Firewall.NewListFirewallRulesParams()
@@ -750,12 +808,11 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	if lb.projectID != "" {
 		p.SetProjectid(lb.projectID)
 	}
-	klog.V(4).Infof("Listing firewall rules for %v", p)
 	r, err := lb.Firewall.ListFirewallRules(p)
 	if err != nil {
 		return false, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
 	}
-	klog.V(4).Infof("All firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
+	klog.V(4).Infof("Existing firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
 
 	// find all rules that have a matching proto+port
 	// a map may or may not be faster, but is a bit easier to understand
@@ -771,8 +828,8 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	var match *cloudstack.FirewallRule
 	for rule := range filtered {
 		cidrlist := strings.Split(rule.Cidrlist, ",")
-		if compareStringSlice(cidrlist, allowedIPs) {
-			klog.V(4).Infof("Found identical rule: %v", rule)
+		if compareStringSlice(cidrlist, allowedCIDRs) {
+			klog.V(4).Infof("Found identical rule: %v", ruleToString(rule))
 			match = rule
 
 			break
@@ -800,13 +857,13 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	if match == nil {
 		// no rule found, create a new one
 		p := lb.Firewall.NewCreateFirewallRuleParams(publicIPID, protocol.IPProtocol())
-		p.SetCidrlist(allowedIPs)
+		p.SetCidrlist(allowedCIDRs)
 		p.SetStartport(publicPort)
 		p.SetEndport(publicPort)
 		_, err = lb.Firewall.CreateFirewallRule(p)
 		if err != nil {
 			// return immediately if we can't create the new rule
-			return false, fmt.Errorf("error creating new firewall rule for public IP %v, proto %v, port %v, allowed %v: %w", publicIPID, protocol, publicPort, allowedIPs, err)
+			return false, fmt.Errorf("error creating new firewall rule for public IP %v, proto %v, port %v, allowed %v: %w", publicIPID, protocol, publicPort, allowedCIDRs, err)
 		}
 	}
 
@@ -852,9 +909,38 @@ func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, pr
 	return deleted, err
 }
 
-// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting.
+// getLoadBalancerSourceRanges first tries to parse and verify loadBalancerSourceRanges field from a Service object.
+// If the field is not specified in the Service, try to parse and verify the AnnotationLoadBalancerSourceRangesKey annotation from a service,
+// extracting the source ranges to allow. If the annotation is not present either, return a default (allow-all) value.
+func getLoadBalancerSourceRanges(service *corev1.Service) (utilnet.IPNetSet, error) {
+	var ipnets utilnet.IPNetSet
+	var err error
+	// if SourceRange field is specified, ignore sourceRange annotation
+	if len(service.Spec.LoadBalancerSourceRanges) > 0 {
+		specs := service.Spec.LoadBalancerSourceRanges
+		ipnets, err = utilnet.ParseIPNets(specs...)
+
+		if err != nil {
+			return nil, fmt.Errorf("service.Spec.LoadBalancerSourceRanges: %v is not valid. Expecting a list of IP ranges. For example, 10.0.0.0/24. Error msg: %v", specs, err)
+		}
+	} else {
+		val := service.Annotations[corev1.AnnotationLoadBalancerSourceRangesKey]
+		val = strings.TrimSpace(val)
+		if val == "" {
+			val = defaultAllowedCIDR
+		}
+		specs := strings.Split(val, ",")
+		ipnets, err = utilnet.ParseIPNets(specs...)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s is not valid. Expecting a comma-separated list of source IP ranges. For example, 10.0.0.0/24,192.168.2.0/24", corev1.AnnotationLoadBalancerSourceRangesKey, val)
+		}
+	}
+	return ipnets, nil
+}
+
+// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's string value or a specified defaultSetting.
 func getStringFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting string) string {
-	klog.V(4).InfoS("getStringFromServiceAnnotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
+	klog.V(4).InfoS("Attempting to get string value from service annotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	if annotationValue, ok := service.Annotations[annotationKey]; ok {
 		// If there is an annotation for this setting, set the "setting" var to it
 		// annotationValue can be empty, it is working as designed
@@ -865,7 +951,7 @@ func getStringFromServiceAnnotation(service *corev1.Service, annotationKey strin
 	}
 	// If there is no annotation, set "settings" var to the value from cloud config
 	if defaultSetting != "" {
-		klog.V(4).Infof("Could not find a Service Annotation; falling back on cloud-config setting: %v = %v", annotationKey, defaultSetting)
+		klog.V(4).InfoS("Could not find a Service Annotation; falling back on cloud-config setting", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	}
 
 	return defaultSetting
@@ -873,7 +959,7 @@ func getStringFromServiceAnnotation(service *corev1.Service, annotationKey strin
 
 // getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's boolean value or a specified defaultSetting.
 func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting bool) bool {
-	klog.V(4).InfoS("getBoolFromServiceAnnotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
+	klog.V(4).InfoS("Attempting to get bool value from service annotation", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 	if annotationValue, ok := service.Annotations[annotationKey]; ok {
 		var returnValue bool
 		switch annotationValue {
@@ -889,7 +975,7 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 
 		return returnValue
 	}
-	klog.V(4).Infof("Could not find a Service Annotation; falling back to default setting: %v = %v", annotationKey, defaultSetting)
+	klog.V(4).InfoS("Could not find a Service Annotation; falling back to default setting", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 
 	return defaultSetting
 }
