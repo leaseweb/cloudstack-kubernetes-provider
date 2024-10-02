@@ -798,8 +798,9 @@ func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
 //
 // Returns true if the firewall rule was created or updated.
 func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
+	// Default to allow-all if no allowed CIDRs are defined.
 	if len(allowedCIDRs) == 0 {
-		return false, errors.New("the allowed CIDR list cannot be empty")
+		allowedCIDRs = []string{defaultAllowedCIDR}
 	}
 
 	p := lb.Firewall.NewListFirewallRulesParams()
@@ -919,7 +920,6 @@ func getLoadBalancerSourceRanges(service *corev1.Service) (utilnet.IPNetSet, err
 	if len(service.Spec.LoadBalancerSourceRanges) > 0 {
 		specs := service.Spec.LoadBalancerSourceRanges
 		ipnets, err = utilnet.ParseIPNets(specs...)
-
 		if err != nil {
 			return nil, fmt.Errorf("service.Spec.LoadBalancerSourceRanges: %v is not valid. Expecting a list of IP ranges. For example, 10.0.0.0/24. Error msg: %v", specs, err)
 		}
@@ -935,6 +935,7 @@ func getLoadBalancerSourceRanges(service *corev1.Service) (utilnet.IPNetSet, err
 			return nil, fmt.Errorf("%s: %s is not valid. Expecting a comma-separated list of source IP ranges. For example, 10.0.0.0/24,192.168.2.0/24", corev1.AnnotationLoadBalancerSourceRangesKey, val)
 		}
 	}
+
 	return ipnets, nil
 }
 
