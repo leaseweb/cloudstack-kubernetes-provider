@@ -30,7 +30,8 @@ commonAnnotations: {}
 # Image repository name and tag
 image:
   repository: "ghcr.io/leaseweb/cloudstack-kubernetes-provider"
-  tag: "1.2.1"
+  # Overrides the image tag whose default is {{ .Chart.AppVersion }}
+  tag: ""
 
 # Additional containers which are run before the app containers are started.
 extraInitContainers: []
