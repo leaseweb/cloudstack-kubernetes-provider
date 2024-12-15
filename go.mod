@@ -11,7 +11,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	gopkg.in/gcfg.v1 v1.2.3
 	k8s.io/api v0.30.5
-	k8s.io/apimachinery v0.30.5
+	k8s.io/apimachinery v0.30.8
 	k8s.io/client-go v0.30.5
 	k8s.io/cloud-provider v0.30.5
 	k8s.io/component-base v0.30.5
