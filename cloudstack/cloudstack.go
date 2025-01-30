@@ -49,9 +49,11 @@ type CSConfig struct {
 	}
 }
 
-var _ cloudprovider.Interface = (*CSCloud)(nil)
-var _ cloudprovider.InstancesV2 = (*CSCloud)(nil)
-var _ cloudprovider.LoadBalancer = (*CSCloud)(nil)
+var (
+	_ cloudprovider.Interface    = (*CSCloud)(nil)
+	_ cloudprovider.InstancesV2  = (*CSCloud)(nil)
+	_ cloudprovider.LoadBalancer = (*CSCloud)(nil)
+)
 
 // CSCloud is an implementation of Interface for CloudStack.
 type CSCloud struct {

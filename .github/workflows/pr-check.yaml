@@ -1,0 +1,50 @@
+name: PR Check
+
+on:
+  pull_request: {}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup up Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.63.4
+          args: --timeout=5m
+
+  build:
+    name: Test & Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup up Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Run sanity tests
+        run: make test-sanity
+
+      - name: Build
+        run: make

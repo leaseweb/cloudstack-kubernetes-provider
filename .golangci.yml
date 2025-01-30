@@ -1,0 +1,47 @@
+issues:
+  exclude-use-default: true
+  max-issues-per-linter: 50
+  max-same-issues: 0 # disable
+  exclude-rules:
+    - path: _test.go
+      linters:
+        - funlen
+        - nestif
+
+linters-settings:
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/leaseweb/cloudstack-csi-driver)
+  goimports:
+    local-prefixes: github.com/leaseweb/cloudstack-csi-driver
+
+  misspell:
+    locale: US
+
+linters:
+  enable-all: true
+  disable:
+    - execinquery
+    - cyclop
+    - depguard
+    - err113
+    - exhaustruct
+    - funlen
+    - gochecknoglobals
+    - gomnd
+    - inamedparam
+    - ireturn
+    - lll
+    - mnd
+    - paralleltest
+    - tagliatelle
+    - testpackage
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - execinquery
+    - gomnd
+    # Todo remove nestedif
+    - nestif

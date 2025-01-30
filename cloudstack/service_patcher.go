@@ -55,6 +55,7 @@ func (sp *servicePatcher) Patch(ctx context.Context, err error) error {
 		return err
 	}
 	perr := patchService(ctx, sp.kclient, sp.base, sp.updated)
+
 	return utilerrors.NewAggregate([]error{err, perr})
 }
 

@@ -6,19 +6,21 @@ import (
 	"testing"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
-	"github.com/golang/mock/gomock"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cloudprovider "k8s.io/cloud-provider"
 )
 
+const testVM = "testDummyVM"
+
 func makeInstance(instanceID, privateIP, publicIP string, stateName string) *cloudstack.VirtualMachine {
 	instance := cloudstack.VirtualMachine{
 		Id:                  instanceID,
-		Name:                "testDummyVM",
-		Displayname:         "testDummyVM",
+		Name:                testVM,
+		Displayname:         testVM,
 		State:               stateName,
 		Zoneid:              "1d8d87d4-1425-459c-8d81-c6f57dca2bd2",
 		Zonename:            "shouldwork",
@@ -101,7 +103,7 @@ func TestInstanceExists(t *testing.T) {
 		client: cs,
 	}
 
-	nodeName := "testDummyVM"
+	nodeName := testVM
 
 	tests := []struct {
 		name           string
@@ -139,8 +141,8 @@ func TestInstanceExists(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			// t.Logf("test node: %v", test.node)
 			if test.node.Spec.ProviderID == "" {
-				if test.node.Name == "testDummyVM" {
-					ms.EXPECT().GetVirtualMachineByName("testDummyVM", gomock.Any()).Return(test.mockedCSOutput, 1, nil)
+				if test.node.Name == testVM {
+					ms.EXPECT().GetVirtualMachineByName(testVM, gomock.Any()).Return(test.mockedCSOutput, 1, nil)
 				} else {
 					ms.EXPECT().GetVirtualMachineByName("nonExistingVM", gomock.Any()).Return(test.mockedCSOutput, 0, errors.New("No match found for ...")) //nolint: revive
 				}
@@ -171,7 +173,7 @@ func TestInstanceShutdown(t *testing.T) {
 		client: cs,
 	}
 
-	nodeName := "testDummyVM"
+	nodeName := testVM
 
 	tests := []struct {
 		name           string
@@ -220,7 +222,7 @@ func TestInstanceShutdown(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if test.node.Spec.ProviderID == "" {
-				ms.EXPECT().GetVirtualMachineByName("testDummyVM", gomock.Any()).Return(test.mockedCSOutput, 1, nil)
+				ms.EXPECT().GetVirtualMachineByName(testVM, gomock.Any()).Return(test.mockedCSOutput, 1, nil)
 			} else {
 				ms.EXPECT().GetVirtualMachineByID("915653c4-298b-4d74-bdee-4ced282114f1", gomock.Any()).Return(test.mockedCSOutput, 1, nil)
 			}
@@ -248,7 +250,7 @@ func TestInstanceMetadata(t *testing.T) {
 		client: cs,
 	}
 
-	nodeName := "testDummyVM"
+	nodeName := testVM
 
 	tests := []struct {
 		name           string
@@ -369,7 +371,7 @@ func TestInstanceMetadata(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if test.node.Spec.ProviderID == "" {
-				ms.EXPECT().GetVirtualMachineByName("testDummyVM", gomock.Any()).Return(test.mockedCSOutput, 1, nil)
+				ms.EXPECT().GetVirtualMachineByName(testVM, gomock.Any()).Return(test.mockedCSOutput, 1, nil)
 			} else {
 				ms.EXPECT().GetVirtualMachineByID("915653c4-298b-4d74-bdee-4ced282114f1", gomock.Any()).Return(test.mockedCSOutput, 1, nil)
 			}

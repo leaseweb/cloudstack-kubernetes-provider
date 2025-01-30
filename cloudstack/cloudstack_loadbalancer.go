@@ -53,8 +53,11 @@ const (
 	ServiceAnnotationLoadBalancerAddress = "service.beta.kubernetes.io/cloudstack-load-balancer-address"
 
 	// Used to construct the load balancer name.
-	servicePrefix = "K8s_svc_"
-	lbNameFormat  = "%s%s_%s_%s"
+	servicePrefix    = "K8s_svc_"
+	lbNameFormat     = "%s%s_%s_%s"
+	ProtocolTCP      = "tcp"
+	ProtocolUDP      = "udp"
+	ProtocolTCPProxy = "tcp-proxy"
 )
 
 type loadBalancer struct {
@@ -96,6 +99,8 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 }
 
 // EnsureLoadBalancer creates a new load balancer, or updates the existing one. Returns the status of the balancer.
+//
+//nolint:gocognit
 func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) {
 	klog.V(4).InfoS("EnsureLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
@@ -146,7 +151,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			defer func(lb *loadBalancer) {
 				if err != nil {
 					if err := lb.releaseLoadBalancerIP(); err != nil {
-						klog.Errorf(err.Error())
+						klog.Errorf("error occurred: %s", err.Error())
 					}
 				}
 			}(lb)
@@ -742,9 +747,9 @@ func ruleToString(rule *cloudstack.FirewallRule) string {
 		ls.WriteString("nil")
 	} else {
 		switch rule.Protocol {
-		case "tcp":
+		case ProtocolTCP:
 			fallthrough
-		case "udp":
+		case ProtocolUDP:
 			fmt.Fprintf(ls, "{[%s] -> %s:[%d-%d] (%s)}", rule.Cidrlist, rule.Ipaddress, rule.Startport, rule.Endport, rule.Protocol)
 		case "icmp":
 			fmt.Fprintf(ls, "{[%s] -> %s [%d,%d] (%s)}", rule.Cidrlist, rule.Ipaddress, rule.Icmptype, rule.Icmpcode, rule.Protocol)
@@ -981,7 +986,7 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	return defaultSetting
 }
 
-// setServiceAnnotation is used to create/set or update an annotation on the Service object
+// setServiceAnnotation is used to create/set or update an annotation on the Service object.
 func setServiceAnnotation(service *corev1.Service, key, value string) {
 	if service.ObjectMeta.Annotations == nil {
 		service.ObjectMeta.Annotations = map[string]string{}
