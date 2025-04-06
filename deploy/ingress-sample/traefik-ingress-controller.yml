@@ -20,7 +20,8 @@ kind: Service
 metadata:
   name: traefik
   annotations:
-    service.beta.kubernetes.io/cloudstack-load-balancer-proxy-protocol: enabled
+    service.beta.kubernetes.io/cloudstack-load-balancer-proxy-protocol: "true"
+    service.beta.kubernetes.io/cloudstack-load-balancer-ip-mode: Proxy # or VIP
 spec:
   type: LoadBalancer
   ports:

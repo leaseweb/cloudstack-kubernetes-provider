@@ -28,6 +28,7 @@ import (
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
@@ -43,6 +44,12 @@ const (
 	// Note that this protocol only applies to TCP service ports and
 	// CloudStack >= 4.6 is required for it to work.
 	ServiceAnnotationLoadBalancerProxyProtocol = "service.beta.kubernetes.io/cloudstack-load-balancer-proxy-protocol"
+
+	// ServiceAnnotationLoadBalancerIPMode is the annotation used on the
+	// service to enable the proxy protocol support on Kubernetes services.
+	// Note that this setting only applies to Kubernetes >= v1.32 is required for it to work.
+	// Supported options are "VIP" and "Proxy".
+	ServiceAnnotationLoadBalancerIPMode = "service.beta.kubernetes.io/cloudstack-load-balancer-ip-mode"
 
 	// ServiceAnnotationLoadBalancerLoadbalancerHostname can be used in conjunction
 	// with PROXY protocol to allow the service to be accessible from inside the
@@ -258,6 +265,26 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 	// Default to IP
 	status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr}}
+
+	// Assign LoadBalancer status IP together with ipMode (Kubernetes >= 1.32)
+	// Checks if annotation was set, if not, fallbacks to default mode ("VIP" for tcp and "Proxy" for tcp-proxy)
+	if ipmode := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerIPMode, ""); ipmode != "" {
+		if ipmode != "VIP" && ipmode != "Proxy" {
+			msg := fmt.Sprintf("Invalid ipMode '%s' for Service %s: must be either 'VIP' or 'Proxy'", ipmode, service.Name)
+			klog.Warning(msg)
+			return nil, fmt.Errorf(msg) // return an error to stop execution
+		}
+		switch ipmode {
+		case "Proxy":
+			proxyMode := v1.LoadBalancerIPModeProxy
+			status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr, IPMode: (&proxyMode)}}
+			return status, nil
+		case "VIP":
+			vipMode := v1.LoadBalancerIPModeVIP
+			status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr, IPMode: (&vipMode)}}
+			return status, nil
+		}
+	}
 
 	return status, nil
 }
