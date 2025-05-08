@@ -50,10 +50,10 @@ func (cs *CSCloud) nodeAddresses(instance *cloudstack.VirtualMachine) ([]corev1.
 	return addresses, nil
 }
 
-func (cs *CSCloud) InstanceExists(ctx context.Context, node *corev1.Node) (bool, error) {
-	_, err := cs.getInstance(ctx, node)
+func (cs *CSCloud) InstanceExists(_ context.Context, node *corev1.Node) (bool, error) {
+	_, err := cs.getInstance(node)
 
-	if errors.Is(err, cloudprovider.InstanceNotFound) { //nolint: errorlint
+	if errors.Is(err, cloudprovider.InstanceNotFound) { //nolint:errorlint
 		klog.V(4).Infof("Instance not found for node: %s", node.Name)
 
 		return false, nil
@@ -66,8 +66,8 @@ func (cs *CSCloud) InstanceExists(ctx context.Context, node *corev1.Node) (bool,
 	return true, nil
 }
 
-func (cs *CSCloud) InstanceShutdown(ctx context.Context, node *corev1.Node) (bool, error) {
-	instance, err := cs.getInstance(ctx, node)
+func (cs *CSCloud) InstanceShutdown(_ context.Context, node *corev1.Node) (bool, error) {
+	instance, err := cs.getInstance(node)
 	if err != nil {
 		return false, err
 	}
@@ -75,8 +75,8 @@ func (cs *CSCloud) InstanceShutdown(ctx context.Context, node *corev1.Node) (boo
 	return instance != nil && instance.State == "Stopped", nil
 }
 
-func (cs *CSCloud) InstanceMetadata(ctx context.Context, node *corev1.Node) (*cloudprovider.InstanceMetadata, error) {
-	instance, err := cs.getInstance(ctx, node)
+func (cs *CSCloud) InstanceMetadata(_ context.Context, node *corev1.Node) (*cloudprovider.InstanceMetadata, error) {
+	instance, err := cs.getInstance(node)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +100,8 @@ func getInstanceProviderID(instance *cloudstack.VirtualMachine) string {
 	return fmt.Sprintf("%s:///%s", ProviderName, instance.Id)
 }
 
-func (cs *CSCloud) getInstance(ctx context.Context, node *corev1.Node) (*cloudstack.VirtualMachine, error) {
-	if node.Spec.ProviderID == "" {
+func (cs *CSCloud) getInstance(node *corev1.Node) (*cloudstack.VirtualMachine, error) {
+	if node.Spec.ProviderID == "" { //nolint:nestif
 		var err error
 		klog.V(4).Infof("looking for node by node name %v", node.Name)
 		instance, count, err := cs.client.VirtualMachine.GetVirtualMachineByName(

@@ -45,11 +45,11 @@ func (p LoadBalancerProtocol) String() string {
 func (p LoadBalancerProtocol) CSProtocol() string {
 	switch p {
 	case LoadBalancerProtocolTCP:
-		return "tcp"
+		return ProtoTCP
 	case LoadBalancerProtocolUDP:
-		return "udp"
+		return ProtoUDP
 	case LoadBalancerProtocolTCPProxy:
-		return "tcp-proxy"
+		return ProtoTCPProxy
 	default:
 		return ""
 	}
@@ -62,9 +62,9 @@ func (p LoadBalancerProtocol) IPProtocol() string {
 	case LoadBalancerProtocolTCP:
 		fallthrough
 	case LoadBalancerProtocolTCPProxy:
-		return "tcp"
+		return ProtoTCP
 	case LoadBalancerProtocolUDP:
-		return "udp"
+		return ProtoUDP
 	default:
 		return ""
 	}
@@ -101,11 +101,11 @@ func ProtocolFromServicePort(port corev1.ServicePort, service *corev1.Service) L
 // CloudStack load balancer protocol name.
 func ProtocolFromLoadBalancer(protocol string) LoadBalancerProtocol {
 	switch protocol {
-	case "tcp":
+	case ProtoTCP:
 		return LoadBalancerProtocolTCP
-	case "udp":
+	case ProtoUDP:
 		return LoadBalancerProtocolUDP
-	case "tcp-proxy":
+	case ProtoTCPProxy:
 		return LoadBalancerProtocolTCPProxy
 	default:
 		return LoadBalancerProtocolInvalid

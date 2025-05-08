@@ -96,7 +96,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 }
 
 // EnsureLoadBalancer creates a new load balancer, or updates the existing one. Returns the status of the balancer.
-func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) {
+func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) { //nolint:gocognit,gocyclo,nestif
 	klog.V(4).InfoS("EnsureLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
@@ -132,7 +132,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		return nil, err
 	}
 
-	if !lb.hasLoadBalancerIP() {
+	if !lb.hasLoadBalancerIP() { //nolint:nestif
 		// Create or retrieve the load balancer IP.
 		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
 			return nil, err
@@ -146,7 +146,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			defer func(lb *loadBalancer) {
 				if err != nil {
 					if err := lb.releaseLoadBalancerIP(); err != nil {
-						klog.Errorf(err.Error())
+						klog.Errorf("Attempt to release load balancer IP failed: %s", err.Error())
 					}
 				}
 			}(lb)
@@ -174,7 +174,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, err
 		}
 
-		if lbRule != nil {
+		if lbRule != nil { //nolint:nestif
 			if needsUpdate {
 				klog.V(4).Infof("Updating load balancer rule: %v", lbRuleName)
 				if err := lb.updateLoadBalancerRule(lbRuleName, protocol); err != nil {
@@ -336,7 +336,7 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	for _, lbRule := range lb.rules {
 		klog.V(4).Infof("Deleting firewall rules for load balancer: %v", lbRule.Name)
 		protocol := ProtocolFromLoadBalancer(lbRule.Protocol)
-		if protocol == LoadBalancerProtocolInvalid {
+		if protocol == LoadBalancerProtocolInvalid { //nolint:nestif
 			klog.Errorf("Error parsing protocol: %v", lbRule.Protocol)
 		} else {
 			port, err := strconv.ParseInt(lbRule.Publicport, 10, 32)
@@ -398,7 +398,7 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 	}
 
 	// If no rules were found, check the legacy name.
-	if len(l.LoadBalancerRules) == 0 {
+	if len(l.LoadBalancerRules) == 0 { //nolint:nestif
 		if len(legacyName) > 0 {
 			p.SetKeyword(legacyName)
 			l, err = cs.client.LoadBalancer.ListLoadBalancerRules(p)
@@ -688,7 +688,7 @@ func symmetricDifference(hostIDs []string, lbInstances []*cloudstack.VirtualMach
 		newIDs[hostID] = true
 	}
 
-	var remove []string //nolint: prealloc
+	var remove []string //nolint:prealloc
 	for _, instance := range lbInstances {
 		if newIDs[instance.Id] {
 			delete(newIDs, instance.Id)
@@ -699,7 +699,7 @@ func symmetricDifference(hostIDs []string, lbInstances []*cloudstack.VirtualMach
 		remove = append(remove, instance.Id)
 	}
 
-	var assign []string //nolint: prealloc
+	var assign []string //nolint:prealloc
 	for hostID := range newIDs {
 		assign = append(assign, hostID)
 	}
@@ -742,11 +742,11 @@ func ruleToString(rule *cloudstack.FirewallRule) string {
 		ls.WriteString("nil")
 	} else {
 		switch rule.Protocol {
-		case "tcp":
+		case ProtoTCP:
 			fallthrough
-		case "udp":
+		case ProtoUDP:
 			fmt.Fprintf(ls, "{[%s] -> %s:[%d-%d] (%s)}", rule.Cidrlist, rule.Ipaddress, rule.Startport, rule.Endport, rule.Protocol)
-		case "icmp":
+		case ProtoICMP:
 			fmt.Fprintf(ls, "{[%s] -> %s [%d,%d] (%s)}", rule.Cidrlist, rule.Ipaddress, rule.Icmptype, rule.Icmpcode, rule.Protocol)
 		default:
 			fmt.Fprintf(ls, "{[%s] -> %s (%s)}", rule.Cidrlist, rule.Ipaddress, rule.Protocol)
@@ -875,7 +875,7 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 // deleteFirewallRule deletes the firewall rule associated with the ip:port:protocol combo
 //
 // returns true when corresponding rules were deleted.
-func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol) (bool, error) {
+func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol) (bool, error) { //nolint:unparam
 	p := lb.Firewall.NewListFirewallRulesParams()
 	p.SetIpaddressid(publicIPID)
 	p.SetListall(true)
@@ -921,7 +921,7 @@ func getLoadBalancerSourceRanges(service *corev1.Service) (utilnet.IPNetSet, err
 		specs := service.Spec.LoadBalancerSourceRanges
 		ipnets, err = utilnet.ParseIPNets(specs...)
 		if err != nil {
-			return nil, fmt.Errorf("service.Spec.LoadBalancerSourceRanges: %v is not valid. Expecting a list of IP ranges. For example, 10.0.0.0/24. Error msg: %v", specs, err)
+			return nil, fmt.Errorf("service.Spec.LoadBalancerSourceRanges: %v is not valid. Expecting a list of IP ranges. For example, 10.0.0.0/24. Error msg: %w", specs, err)
 		}
 	} else {
 		val := service.Annotations[corev1.AnnotationLoadBalancerSourceRangesKey]
@@ -981,7 +981,7 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	return defaultSetting
 }
 
-// setServiceAnnotation is used to create/set or update an annotation on the Service object
+// setServiceAnnotation is used to create/set or update an annotation on the Service object.
 func setServiceAnnotation(service *corev1.Service, key, value string) {
 	if service.ObjectMeta.Annotations == nil {
 		service.ObjectMeta.Annotations = map[string]string{}
