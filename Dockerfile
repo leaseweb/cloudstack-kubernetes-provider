@@ -16,10 +16,10 @@
 # under the License.
 
 FROM golang:1.23 AS builder
-COPY . /go/src/github.com/apache/cloudstack-kubernetes-provider
-WORKDIR /go/src/github.com/apache/cloudstack-kubernetes-provider
-RUN make clean && CGO_ENABLED=0 GOOS=linux make
+WORKDIR /app
+COPY . .
+RUN make clean && GOARCH=amd64 GOOS=linux CGO_ENABLED=0 make all
 
 FROM gcr.io/distroless/static:nonroot
-COPY --from=builder /go/src/github.com/apache/cloudstack-kubernetes-provider/cloudstack-ccm /app/cloudstack-ccm
+COPY --from=builder /app/cloudstack-ccm /app/cloudstack-ccm
 ENTRYPOINT [ "/app/cloudstack-ccm", "--cloud-provider", "cloudstack" ]

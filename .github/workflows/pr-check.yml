@@ -18,6 +18,9 @@ jobs:
 
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Lint Check
+        run: make lint
         
       - name: Run Script
         run:  make test
