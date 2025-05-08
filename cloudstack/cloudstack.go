@@ -34,9 +34,6 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 )
 
-// ProviderName is the name of this cloud provider.
-const ProviderName = "cloudstack"
-
 // CSConfig wraps the config for the CloudStack cloud provider.
 type CSConfig struct {
 	Global struct {
@@ -49,9 +46,11 @@ type CSConfig struct {
 	}
 }
 
-var _ cloudprovider.Interface = (*CSCloud)(nil)
-var _ cloudprovider.InstancesV2 = (*CSCloud)(nil)
-var _ cloudprovider.LoadBalancer = (*CSCloud)(nil)
+var (
+	_ cloudprovider.Interface    = (*CSCloud)(nil)
+	_ cloudprovider.InstancesV2  = (*CSCloud)(nil)
+	_ cloudprovider.LoadBalancer = (*CSCloud)(nil)
+)
 
 // CSCloud is an implementation of Interface for CloudStack.
 type CSCloud struct {
@@ -106,7 +105,7 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 }
 
 // Initialize passes a Kubernetes clientBuilder interface to the cloud provider.
-func (cs *CSCloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
+func (cs *CSCloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, _ <-chan struct{}) {
 	clientset := clientBuilder.ClientOrDie("cloud-controller-manager")
 	cs.kclient = clientset
 	eventBroadcaster := record.NewBroadcaster()

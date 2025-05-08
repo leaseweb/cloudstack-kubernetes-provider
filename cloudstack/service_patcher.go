@@ -55,6 +55,7 @@ func (sp *servicePatcher) Patch(ctx context.Context, err error) error {
 		return err
 	}
 	perr := patchService(ctx, sp.kclient, sp.base, sp.updated)
+
 	return utilerrors.NewAggregate([]error{err, perr})
 }
 
@@ -62,24 +63,24 @@ func (sp *servicePatcher) Patch(ctx context.Context, err error) error {
 func patchService(ctx context.Context, client kubernetes.Interface, cur, mod *corev1.Service) error {
 	curJSON, err := json.Marshal(cur)
 	if err != nil {
-		return fmt.Errorf("failed to serialize current service object: %v", err)
+		return fmt.Errorf("failed to serialize current service object: %w", err)
 	}
 
 	modJSON, err := json.Marshal(mod)
 	if err != nil {
-		return fmt.Errorf("failed to serialize modified service object: %v", err)
+		return fmt.Errorf("failed to serialize modified service object: %w", err)
 	}
 
 	patch, err := strategicpatch.CreateTwoWayMergePatch(curJSON, modJSON, corev1.Service{})
 	if err != nil {
-		return fmt.Errorf("failed to create 2-way merge patch: %v", err)
+		return fmt.Errorf("failed to create 2-way merge patch: %w", err)
 	}
 	if len(patch) == 0 || string(patch) == "{}" {
 		return nil
 	}
 	_, err = client.CoreV1().Services(cur.Namespace).Patch(ctx, cur.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to patch service object %s/%s: %v", cur.Namespace, cur.Name, err)
+		return fmt.Errorf("failed to patch service object %s/%s: %w", cur.Namespace, cur.Name, err)
 	}
 
 	return nil
