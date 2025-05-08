@@ -1,0 +1,27 @@
+name: PR Check
+
+on: [pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+  
+jobs: 
+  build:
+    name: Test & Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup up Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        
+      - name: Run Script
+        run:  make test
+
+      - name: Build Docker Image
+        run: make docker
+  
