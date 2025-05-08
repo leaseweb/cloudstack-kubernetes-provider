@@ -90,7 +90,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 	klog.V(4).Infof("Found a load balancer associated with IP %v", lb.ipAddr)
 
 	status := &corev1.LoadBalancerStatus{}
-	status.Ingress = append(status.Ingress, corev1.LoadBalancerIngress{IP: lb.ipAddr})
+	status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr}}
 
 	return status, true, nil
 }
@@ -248,18 +248,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 	}
 
-	status = &corev1.LoadBalancerStatus{}
-	// If hostname is explicitly set using service annotation
-	// Workaround for https://github.com/kubernetes/kubernetes/issues/66607
-	if hostname := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerLoadbalancerHostname, ""); hostname != "" {
-		status.Ingress = []corev1.LoadBalancerIngress{{Hostname: hostname}}
-
-		return status, nil
-	}
-	// Default to IP
-	status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr}}
-
-	return status, nil
+	return lb.generateLoadBalancerStatus(service), nil
 }
 
 // UpdateLoadBalancer updates hosts under the specified load balancer.
@@ -679,6 +668,32 @@ func (lb *loadBalancer) removeHostsFromRule(lbRule *cloudstack.LoadBalancerRule,
 	}
 
 	return nil
+}
+
+// generateLoadBalancerStatus returns the LoadBalancerStatus based on various service annotations.
+func (lb *loadBalancer) generateLoadBalancerStatus(service *corev1.Service) *corev1.LoadBalancerStatus {
+	status := &corev1.LoadBalancerStatus{}
+	// If hostname is explicitly set using service annotation
+	// Workaround for https://github.com/kubernetes/kubernetes/issues/66607
+	if hostname := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerLoadbalancerHostname, ""); hostname != "" {
+		status.Ingress = []corev1.LoadBalancerIngress{{Hostname: hostname}}
+
+		return status
+	}
+
+	ipMode := corev1.LoadBalancerIPModeVIP
+	if getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyProtocol, false) {
+		// Set the LoadBalancerIPMode to Proxy to prevent kube-proxy from injecting an iptables bypass.
+		// https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/1860-kube-proxy-IP-node-binding
+		ipMode = corev1.LoadBalancerIPModeProxy
+	}
+	// Default to IP
+	status.Ingress = []corev1.LoadBalancerIngress{{
+		IP:     lb.ipAddr,
+		IPMode: &ipMode,
+	}}
+
+	return status
 }
 
 // symmetricDifference returns the symmetric difference between the old (existing) and new (wanted) host ID's.
