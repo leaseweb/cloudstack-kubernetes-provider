@@ -30,6 +30,44 @@ LDFLAGS="-X 'k8s.io/component-base/version.gitVersion=${GIT_VERSION}' -X 'k8s.io
 CMD_SRC=\
 	cmd/cloudstack-ccm/main.go
 
+export REPO_ROOT := $(shell git rev-parse --show-toplevel)
+
+# Directories
+TOOLS_DIR := $(REPO_ROOT)/hack/tools
+TOOLS_BIN_DIR := $(TOOLS_DIR)/bin
+BIN_DIR ?= bin
+
+GO_INSTALL := ./hack/go_install.sh
+
+GOLANGCI_LINT_BIN := golangci-lint
+GOLANGCI_LINT_VER := v1.63.4
+GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/$(GOLANGCI_LINT_BIN)-$(GOLANGCI_LINT_VER))
+GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/cmd/golangci-lint
+
+##@ Linting
+## --------------------------------------
+## Linting
+## --------------------------------------
+
+.PHONY: fmt
+fmt: ## Run go fmt on the whole project.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet on the whole project.
+	go vet ./...
+
+.PHONY: lint
+lint: $(GOLANGCI_LINT) ## Run linting for the project.
+	$(MAKE) fmt
+	$(MAKE) vet
+	$(GOLANGCI_LINT) run -v --timeout 360s ./...
+
+##@ Build
+## --------------------------------------
+## Build
+## --------------------------------------
+
 .PHONY: all clean docker
 
 all: cloudstack-ccm
@@ -54,3 +92,11 @@ docker:
 ifneq (${GIT_IS_TAG},NOT_A_TAG)
 	docker tag ghcr.io/leaseweb/cloudstack-kubernetes-provider:${GIT_COMMIT_SHORT} ghcr.io/leaseweb/cloudstack-kubernetes-provider:${GIT_TAG}
 endif
+
+##@ hack/tools:
+
+.PHONY: $(GOLANGCI_LINT_BIN)
+$(GOLANGCI_LINT_BIN): $(GOLANGCI_LINT) ## Build a local copy of golangci-lint.
+
+$(GOLANGCI_LINT): # Build golangci-lint from tools folder.
+	GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(GOLANGCI_LINT_PKG) $(GOLANGCI_LINT_BIN) $(GOLANGCI_LINT_VER)
