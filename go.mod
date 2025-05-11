@@ -8,7 +8,7 @@ require (
 	github.com/apache/cloudstack-go/v2 v2.17.0
 	github.com/google/go-cmp v0.6.0
 	github.com/stretchr/testify v1.10.0
-	go.uber.org/mock v0.5.0
+	go.uber.org/mock v0.5.2
 	gopkg.in/gcfg.v1 v1.2.3
 	k8s.io/api v0.31.8
 	k8s.io/apimachinery v0.31.8
