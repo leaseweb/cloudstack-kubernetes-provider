@@ -1,13 +1,12 @@
 # CloudStack Kubernetes Provider
 
-[![](https://img.shields.io/github/release/apache/cloudstack-kubernetes-provider.svg?logo=github&style=flat-square "Release")](https://github.com/apache/cloudstack-kubernetes-provider/releases)
+[![](https://img.shields.io/github/v/release/leaseweb/cloudstack-kubernetes-provider?filter=v*&style=flat-square "Release")](https://github.com/apache/cloudstack-kubernetes-provider/releases)
 [![](https://img.shields.io/badge/license-Apache%202.0-blue.svg?color=%23282661&logo=apache&style=flat-square "Apache 2.0 license")](/LICENSE-2.0)
 [![](https://img.shields.io/badge/language-Go-%235adaff.svg?logo=go&style=flat-square "Go language")](https://golang.org)
-[![](https://img.shields.io/docker/v/apache/cloudstack-kubernetes-provider?label=docker%20hub&logo=docker&style=flat-square "Docker Hub Image Version")](https://hub.docker.com/r/apache/cloudstack-kubernetes-provider/)
 
 A Cloud Controller Manager to facilitate Kubernetes deployments on Cloudstack.
 
-Based on the old Cloudstack provider in Kubernetes was removed.
+Based on the old in-tree CloudStack provider in Kubernetes that was removed.
 
 Refer:
 * https://github.com/kubernetes/kubernetes/tree/release-1.15/pkg/cloudprovider/providers/cloudstack
@@ -26,7 +25,7 @@ The provider can also be manually deployed as follows :
 
 ### Kubernetes
 
-Prebuilt containers are posted on [Docker Hub](https://hub.docker.com/r/apache/cloudstack-kubernetes-provider).
+Prebuilt containers are posted [here](https://github.com/leaseweb/cloudstack-kubernetes-provider/pkgs/container/cloudstack-kubernetes-provider).
 
 To configure API access to your CloudStack management server, you need to create a secret containing a `cloud-config`
 that is suitable for your environment.
