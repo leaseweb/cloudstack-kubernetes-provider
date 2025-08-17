@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM golang:1.23 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /app
 COPY . .
 RUN make clean && GOARCH=amd64 GOOS=linux CGO_ENABLED=0 make all
