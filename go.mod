@@ -11,7 +11,7 @@ require (
 	go.uber.org/mock v0.5.2
 	gopkg.in/gcfg.v1 v1.2.3
 	k8s.io/api v0.32.7
-	k8s.io/apimachinery v0.32.7
+	k8s.io/apimachinery v0.32.9
 	k8s.io/client-go v0.32.7
 	k8s.io/cloud-provider v0.32.7
 	k8s.io/component-base v0.32.7
