@@ -1,2 +1,5 @@
 /cloudstack-ccm
 /hack/tools/bin
+.idea/
+.tests/
+.tool-versions
