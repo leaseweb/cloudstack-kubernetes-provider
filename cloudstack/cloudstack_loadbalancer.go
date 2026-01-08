@@ -1436,10 +1436,10 @@ func getLoadBalancerNetworkID(service *corev1.Service) string {
 
 // setServiceAnnotation is used to create/set or update an annotation on the Service object.
 func setServiceAnnotation(service *corev1.Service, key, value string) {
-	if service.ObjectMeta.Annotations == nil {
-		service.ObjectMeta.Annotations = map[string]string{}
+	if service.Annotations == nil {
+		service.Annotations = map[string]string{}
 	}
-	service.ObjectMeta.Annotations[key] = value
+	service.Annotations[key] = value
 }
 
 // deleteServiceAnnotation removes an annotation from the Service object.
