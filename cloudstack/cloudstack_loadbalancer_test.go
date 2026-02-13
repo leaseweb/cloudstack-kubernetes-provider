@@ -2343,10 +2343,8 @@ func TestVerifyHosts(t *testing.T) {
 			},
 		}
 
-		gomock.InOrder(
-			mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams),
-			mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil),
-		)
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
 
 		cs := &CSCloud{
 			client: &cloudstack.CloudStackClient{
@@ -2397,10 +2395,8 @@ func TestVerifyHosts(t *testing.T) {
 			},
 		}
 
-		gomock.InOrder(
-			mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams),
-			mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil),
-		)
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
 
 		cs := &CSCloud{
 			client: &cloudstack.CloudStackClient{
@@ -2433,10 +2429,8 @@ func TestVerifyHosts(t *testing.T) {
 			VirtualMachines: []*cloudstack.VirtualMachine{},
 		}
 
-		gomock.InOrder(
-			mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams),
-			mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil),
-		)
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
 
 		cs := &CSCloud{
 			client: &cloudstack.CloudStackClient{
@@ -2452,8 +2446,8 @@ func TestVerifyHosts(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected error")
 		}
-		if !strings.Contains(err.Error(), "none of the hosts matched") {
-			t.Errorf("error message = %q, want to contain 'none of the hosts matched'", err.Error())
+		if !strings.Contains(err.Error(), "could not match any") {
+			t.Errorf("error message = %q, want to contain 'could not match any'", err.Error())
 		}
 	})
 
@@ -2476,10 +2470,8 @@ func TestVerifyHosts(t *testing.T) {
 			},
 		}
 
-		gomock.InOrder(
-			mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams),
-			mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil),
-		)
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
 
 		cs := &CSCloud{
 			client: &cloudstack.CloudStackClient{
@@ -2522,10 +2514,8 @@ func TestVerifyHosts(t *testing.T) {
 			},
 		}
 
-		gomock.InOrder(
-			mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams),
-			mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil),
-		)
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
 
 		cs := &CSCloud{
 			client: &cloudstack.CloudStackClient{
@@ -2546,6 +2536,208 @@ func TestVerifyHosts(t *testing.T) {
 		}
 		if networkID != "net-123" {
 			t.Errorf("networkID = %q, want %q", networkID, "net-123")
+		}
+	})
+
+	t.Run("partial match during rolling upgrade - some nodes not yet in CloudStack", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+		listParams := &cloudstack.ListVirtualMachinesParams{}
+		// Only node-1 exists in CloudStack; node-2 is still being provisioned.
+		listResp := &cloudstack.ListVirtualMachinesResponse{
+			Count: 1,
+			VirtualMachines: []*cloudstack.VirtualMachine{
+				{
+					Id:   "vm-1",
+					Name: "node-1",
+					Nic: []cloudstack.Nic{
+						{Networkid: "net-123"},
+					},
+				},
+			},
+		}
+
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				VirtualMachine: mockVM,
+			},
+		}
+
+		nodes := []*corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-2"}}, // Not yet in CloudStack
+		}
+
+		// Should succeed with partial match - only node-1 matched
+		hostIDs, networkID, err := cs.verifyHosts(nodes)
+		if err != nil {
+			t.Fatalf("unexpected error (should tolerate partial match): %v", err)
+		}
+		if len(hostIDs) != 1 {
+			t.Errorf("hostIDs count = %d, want %d", len(hostIDs), 1)
+		}
+		if hostIDs[0] != "vm-1" {
+			t.Errorf("hostIDs[0] = %q, want %q", hostIDs[0], "vm-1")
+		}
+		if networkID != "net-123" {
+			t.Errorf("networkID = %q, want %q", networkID, "net-123")
+		}
+	})
+
+	t.Run("partial match - VM exists but has no NICs yet", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+		listParams := &cloudstack.ListVirtualMachinesParams{}
+		listResp := &cloudstack.ListVirtualMachinesResponse{
+			Count: 2,
+			VirtualMachines: []*cloudstack.VirtualMachine{
+				{
+					Id:   "vm-1",
+					Name: "node-1",
+					Nic: []cloudstack.Nic{
+						{Networkid: "net-123"},
+					},
+				},
+				{
+					Id:   "vm-2",
+					Name: "node-2",
+					Nic:  []cloudstack.Nic{}, // No NICs yet - still provisioning
+				},
+			},
+		}
+
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				VirtualMachine: mockVM,
+			},
+		}
+
+		nodes := []*corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-2"}},
+		}
+
+		// Should succeed with partial match - node-2 skipped due to no NICs
+		hostIDs, networkID, err := cs.verifyHosts(nodes)
+		if err != nil {
+			t.Fatalf("unexpected error (should tolerate VM with no NICs): %v", err)
+		}
+		if len(hostIDs) != 1 {
+			t.Errorf("hostIDs count = %d, want %d", len(hostIDs), 1)
+		}
+		if hostIDs[0] != "vm-1" {
+			t.Errorf("hostIDs[0] = %q, want %q", hostIDs[0], "vm-1")
+		}
+		if networkID != "net-123" {
+			t.Errorf("networkID = %q, want %q", networkID, "net-123")
+		}
+	})
+
+	t.Run("match by ProviderID when name does not match", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+		listParams := &cloudstack.ListVirtualMachinesParams{}
+		listResp := &cloudstack.ListVirtualMachinesResponse{
+			Count: 1,
+			VirtualMachines: []*cloudstack.VirtualMachine{
+				{
+					Id:   "vm-abc-123",
+					Name: "different-name", // Name does not match node name
+					Nic: []cloudstack.Nic{
+						{Networkid: "net-123"},
+					},
+				},
+			},
+		}
+
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				VirtualMachine: mockVM,
+			},
+		}
+
+		nodes := []*corev1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-node"},
+				Spec: corev1.NodeSpec{
+					ProviderID: "cloudstack:///vm-abc-123", // Matches by VM ID
+				},
+			},
+		}
+
+		hostIDs, networkID, err := cs.verifyHosts(nodes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hostIDs) != 1 {
+			t.Errorf("hostIDs count = %d, want %d", len(hostIDs), 1)
+		}
+		if hostIDs[0] != "vm-abc-123" {
+			t.Errorf("hostIDs[0] = %q, want %q", hostIDs[0], "vm-abc-123")
+		}
+		if networkID != "net-123" {
+			t.Errorf("networkID = %q, want %q", networkID, "net-123")
+		}
+	})
+
+	t.Run("all VMs have no NICs - should error", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+		listParams := &cloudstack.ListVirtualMachinesParams{}
+		listResp := &cloudstack.ListVirtualMachinesResponse{
+			Count: 2,
+			VirtualMachines: []*cloudstack.VirtualMachine{
+				{
+					Id:   "vm-1",
+					Name: "node-1",
+					Nic:  []cloudstack.Nic{},
+				},
+				{
+					Id:   "vm-2",
+					Name: "node-2",
+					Nic:  []cloudstack.Nic{},
+				},
+			},
+		}
+
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(listParams)
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				VirtualMachine: mockVM,
+			},
+		}
+
+		nodes := []*corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "node-2"}},
+		}
+
+		// Should error - all VMs have no NICs, zero backends
+		_, _, err := cs.verifyHosts(nodes)
+		if err == nil {
+			t.Fatalf("expected error when all VMs have no NICs")
+		}
+		if !strings.Contains(err.Error(), "could not match any") {
+			t.Errorf("error message = %q, want to contain 'could not match any'", err.Error())
 		}
 	})
 }

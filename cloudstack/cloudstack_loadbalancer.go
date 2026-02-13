@@ -176,7 +176,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			klog.Errorf("failed to allocated specified IP %v: %v", service.Spec.LoadBalancerIP, err)
+			klog.Errorf("failed to allocate specified IP %v: %v", service.Spec.LoadBalancerIP, err)
 			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
 		}
 
@@ -311,10 +311,16 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 
 		assign, remove := symmetricDifference(lb.hostIDs, l.LoadBalancerRuleInstances)
 
+		klog.V(4).Infof("Load balancer rule %v: %d host(s) to assign, %d host(s) to remove (wanted: %v, current: %d instances)",
+			lbRule.Name, len(assign), len(remove), lb.hostIDs, len(l.LoadBalancerRuleInstances))
+
+		// IMPORTANT: Assign new hosts BEFORE removing old ones to ensure the load balancer
+		// always has backends during rolling upgrades. If assignment fails, we abort without
+		// removing old hosts so traffic can still be served.
 		if len(assign) > 0 {
 			klog.V(4).Infof("Assigning new hosts (%v) to load balancer rule: %v", assign, lbRule.Name)
 			if err := lb.assignHostsToRule(lbRule, assign); err != nil {
-				return err
+				return fmt.Errorf("error assigning new hosts to rule %v (old hosts preserved): %w", lbRule.Name, err)
 			}
 		}
 
@@ -546,35 +552,46 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 }
 
 // verifyHosts verifies if all hosts belong to the same network, and returns the host ID's and network ID.
+// During rolling upgrades some nodes may not yet have a corresponding VM in CloudStack, so we tolerate
+// partial matches: as long as at least one node can be resolved we return the matched set and log
+// warnings for the nodes we could not find.
 func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	hostNames := map[string]bool{}
+	// providerVMIDs maps CloudStack VM IDs extracted from node.Spec.ProviderID
+	// so we can match by ID in addition to name.
+	providerVMIDs := map[string]bool{}
 	for _, node := range nodes {
 		// node.Name can be an FQDN as well, and CloudStack VM names aren't
 		// To match, we need to Split the domain part off here, if present
 		hostNames[strings.Split(strings.ToLower(node.Name), ".")[0]] = true
+
+		// Also extract the VM ID from the ProviderID for a more reliable match.
+		if node.Spec.ProviderID != "" {
+			if id, _, err := instanceIDFromProviderID(node.Spec.ProviderID); err == nil {
+				providerVMIDs[id] = true
+			}
+		}
 	}
 
-	p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
-	p.SetListall(true)
-	p.SetDetails([]string{"min", "nics"})
-
-	if cs.projectID != "" {
-		p.SetProjectid(cs.projectID)
-	}
-
-	l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
+	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
+	allVMs, err := cs.listAllVirtualMachines()
 	if err != nil {
 		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
 	}
 
 	var hostIDs []string
 	var networkID string
+	matchedNames := map[string]bool{}
+	var skippedNoNIC []string
 
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
-	for _, vm := range l.VirtualMachines {
-		if hostNames[strings.ToLower(vm.Name)] {
+	for _, vm := range allVMs {
+		nameMatch := hostNames[strings.ToLower(vm.Name)]
+		idMatch := providerVMIDs[vm.Id]
+		if nameMatch || idMatch {
 			if len(vm.Nic) == 0 {
-				klog.V(4).Infof("Skipping VM %v as it contains no active network interfaces", vm.Name)
+				klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", vm.Name, vm.Id)
+				skippedNoNIC = append(skippedNoNIC, vm.Name)
 				// Skip VM's without any active network interfaces. This happens during rollout f.e.
 				continue
 			}
@@ -584,14 +601,68 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 
 			networkID = vm.Nic[0].Networkid
 			hostIDs = append(hostIDs, vm.Id)
+			matchedNames[strings.ToLower(vm.Name)] = true
 		}
 	}
 
-	if len(hostIDs) == 0 || len(networkID) == 0 {
-		return nil, "", errors.New("none of the hosts matched the list of VMs retrieved from CS API")
+	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
+	var unmatchedNodes []string
+	for _, node := range nodes {
+		shortName := strings.Split(strings.ToLower(node.Name), ".")[0]
+		if !matchedNames[shortName] {
+			unmatchedNodes = append(unmatchedNodes, node.Name)
+		}
+	}
+	if len(unmatchedNodes) > 0 {
+		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(unmatchedNodes), unmatchedNodes)
+	}
+	if len(skippedNoNIC) > 0 {
+		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(skippedNoNIC), skippedNoNIC)
 	}
 
+	if len(hostIDs) == 0 || len(networkID) == 0 {
+		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
+			len(nodes), unmatchedNodes, skippedNoNIC)
+	}
+
+	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(hostIDs), len(nodes))
+
 	return hostIDs, networkID, nil
+}
+
+// listAllVirtualMachines retrieves all VMs using pagination to handle large projects.
+func (cs *CSCloud) listAllVirtualMachines() ([]*cloudstack.VirtualMachine, error) {
+	var allVMs []*cloudstack.VirtualMachine
+
+	page := 1
+	pageSize := 500
+
+	for {
+		p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
+		p.SetListall(true)
+		p.SetDetails([]string{"min", "nics"})
+		p.SetPage(page)
+		p.SetPagesize(pageSize)
+
+		if cs.projectID != "" {
+			p.SetProjectid(cs.projectID)
+		}
+
+		l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
+		if err != nil {
+			return nil, err
+		}
+
+		allVMs = append(allVMs, l.VirtualMachines...)
+
+		// If we got fewer results than the page size, we've reached the last page.
+		if len(l.VirtualMachines) < pageSize {
+			break
+		}
+		page++
+	}
+
+	return allVMs, nil
 }
 
 // hasLoadBalancerIP returns true if we have a load balancer address and ID.
