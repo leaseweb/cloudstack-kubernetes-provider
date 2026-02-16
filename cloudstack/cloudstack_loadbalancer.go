@@ -142,15 +142,46 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
 
-		if lb.ipAddr != "" && lb.ipAddr != service.Spec.LoadBalancerIP {
-			defer func(lb *loadBalancer) {
-				if err != nil {
-					if err := lb.releaseLoadBalancerIP(); err != nil {
-						klog.Errorf("Attempt to release load balancer IP failed: %s", err.Error())
-					}
+	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
+		// LoadBalancerIP was specified and it's different from the current IP
+		// Release the old IP first
+		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, service.Spec.LoadBalancerIP)
+
+		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
+		for _, oldRule := range lb.rules {
+			proto := ProtocolFromLoadBalancer(oldRule.Protocol)
+			port64, pErr := strconv.ParseInt(oldRule.Publicport, 10, 32)
+			if proto != LoadBalancerProtocolInvalid && pErr == nil {
+				if _, fwErr := lb.deleteFirewallRule(oldRule.Publicipid, int(port64), proto); fwErr != nil {
+					klog.V(4).Infof("Ignoring firewall rule delete error for %s: %v", oldRule.Name, fwErr)
 				}
-			}(lb)
+			}
+
+			if delErr := lb.deleteLoadBalancerRule(oldRule); delErr != nil {
+				// CloudStack sometimes reports deletes as "invalid value" when the entity is already gone.
+				if strings.Contains(delErr.Error(), "does not exist") || strings.Contains(delErr.Error(), "Invalid parameter id value") {
+					klog.V(4).Infof("Load balancer rule %s already removed, continuing: %v", oldRule.Name, delErr)
+					continue
+				}
+				return nil, delErr
+			}
 		}
+
+		// Prevent any further cleanup from trying to delete stale IDs.
+		lb.rules = make(map[string]*cloudstack.LoadBalancerRule)
+
+		if err := lb.releaseLoadBalancerIP(); err != nil {
+			klog.Errorf("attempt to release old load balancer IP failed: %s", err.Error())
+			return nil, fmt.Errorf("failed to release old load balancer IP: %w", err)
+		}
+
+		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
+			klog.Errorf("failed to allocate specified IP %v: %v", service.Spec.LoadBalancerIP, err)
+			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
+		}
+
+		msg := fmt.Sprintf("Switched load balancer for service %s to specified IP address %s", serviceName, lb.ipAddr)
+		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "UpdatedLoadBalancer", msg)
 	}
 
 	klog.V(4).Infof("Load balancer %v is associated with IP %v", lb.name, lb.ipAddr)
@@ -280,10 +311,16 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 
 		assign, remove := symmetricDifference(lb.hostIDs, l.LoadBalancerRuleInstances)
 
+		klog.V(4).Infof("Load balancer rule %v: %d host(s) to assign, %d host(s) to remove (wanted: %v, current: %d instances)",
+			lbRule.Name, len(assign), len(remove), lb.hostIDs, len(l.LoadBalancerRuleInstances))
+
+		// IMPORTANT: Assign new hosts BEFORE removing old ones to ensure the load balancer
+		// always has backends during rolling upgrades. If assignment fails, we abort without
+		// removing old hosts so traffic can still be served.
 		if len(assign) > 0 {
 			klog.V(4).Infof("Assigning new hosts (%v) to load balancer rule: %v", assign, lbRule.Name)
 			if err := lb.assignHostsToRule(lbRule, assign); err != nil {
-				return err
+				return fmt.Errorf("error assigning new hosts to rule %v (old hosts preserved): %w", lbRule.Name, err)
 			}
 		}
 
@@ -322,36 +359,132 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 		return err
 	}
 
+	// If no rules exist, the load balancer doesn't exist - nothing to delete
+	if len(lb.rules) == 0 {
+		klog.V(4).Infof("No load balancer rules found for service, nothing to delete")
+		return nil
+	}
+
+	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+	var deletionErrors []error
+
+	// Delete all firewall rules and load balancer rules
 	for _, lbRule := range lb.rules {
-		klog.V(4).Infof("Deleting firewall rules for load balancer: %v", lbRule.Name)
+		klog.V(4).Infof("Processing deletion of load balancer rule: %v", lbRule.Name)
+
+		// Parse protocol
 		protocol := ProtocolFromLoadBalancer(lbRule.Protocol)
-		if protocol == LoadBalancerProtocolInvalid { //nolint:nestif
-			klog.Errorf("Error parsing protocol: %v", lbRule.Protocol)
-		} else {
-			port, err := strconv.ParseInt(lbRule.Publicport, 10, 32)
-			if err != nil {
-				klog.Errorf("Error parsing port: %v", err)
-			} else {
-				if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
-					return err
-				}
-			}
+		if protocol == LoadBalancerProtocolInvalid {
+			err := fmt.Errorf("error parsing protocol %v for rule %v", lbRule.Protocol, lbRule.Name)
+			klog.Errorf("%v", err)
+			deletionErrors = append(deletionErrors, err)
+			// Continue to delete other rules even if this one fails
+			continue
+		}
 
-			klog.V(4).Infof("Deleting load balancer rule: %v", lbRule.Name)
-			if err := lb.deleteLoadBalancerRule(lbRule); err != nil {
-				return err
-			}
+		// Parse port
+		port, err := strconv.ParseInt(lbRule.Publicport, 10, 32)
+		if err != nil {
+			err := fmt.Errorf("error parsing port %s for rule %v: %w", lbRule.Publicport, lbRule.Name, err)
+			klog.Errorf("%v", err)
+			deletionErrors = append(deletionErrors, err)
+			// Continue to delete other rules even if this one fails
+			continue
+		}
+
+		// Delete firewall rules first
+		klog.V(4).Infof("Deleting firewall rules for load balancer rule: %v (IP:%v, Port:%d, Protocol:%v)",
+			lbRule.Name, lbRule.Publicip, port, protocol)
+		if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
+			err := fmt.Errorf("error deleting firewall rules for rule %v: %w", lbRule.Name, err)
+			klog.Errorf("%v", err)
+			deletionErrors = append(deletionErrors, err)
+			// Continue to delete the load balancer rule even if firewall deletion fails
+		}
+
+		// Delete load balancer rule
+		klog.V(4).Infof("Deleting load balancer rule: %v", lbRule.Name)
+		if err := lb.deleteLoadBalancerRule(lbRule); err != nil {
+			err := fmt.Errorf("error deleting load balancer rule %v: %w", lbRule.Name, err)
+			klog.Errorf("%v", err)
+			deletionErrors = append(deletionErrors, err)
+			// Continue to attempt IP cleanup even if this rule deletion fails
 		}
 	}
 
+	// Delete the public IP address if appropriate
 	if lb.ipAddr != "" {
-		klog.V(4).Infof("Releasing load balancer IP: %v", lb.ipAddr)
-		if err := lb.releaseLoadBalancerIP(); err != nil {
-			return err
+		klog.V(4).Infof("Processing public IP deletion for load balancer: IP=%v, ID=%v", lb.ipAddr, lb.ipAddrID)
+
+		// Check if we should release the IP
+		shouldReleaseIP, err := cs.shouldReleaseLoadBalancerIP(lb, service)
+		if err != nil {
+			err := fmt.Errorf("error determining if IP should be released: %w", err)
+			klog.Errorf("%v", err)
+			deletionErrors = append(deletionErrors, err)
+		} else if shouldReleaseIP {
+			klog.V(4).Infof("Releasing load balancer IP: %v", lb.ipAddr)
+			if err := lb.releaseLoadBalancerIP(); err != nil {
+				err := fmt.Errorf("error releasing load balancer IP %v: %w", lb.ipAddr, err)
+				klog.Errorf("%v", err)
+				deletionErrors = append(deletionErrors, err)
+			} else {
+				msg := fmt.Sprintf("Released load balancer IP %s for service %s", lb.ipAddr, serviceName)
+				cs.eventRecorder.Event(service, corev1.EventTypeNormal, "ReleasedLoadBalancerIP", msg)
+				klog.Info(msg)
+			}
+		} else {
+			klog.V(4).Infof("Load balancer IP %v is in use by other services, keeping it allocated", lb.ipAddr)
 		}
 	}
+
+	// Return aggregated errors if any occurred
+	if len(deletionErrors) > 0 {
+		msg := fmt.Sprintf("Encountered %d error(s) while deleting load balancer for service %s", len(deletionErrors), serviceName)
+		klog.Warningf("%s: %v", msg, deletionErrors)
+		cs.eventRecorder.Event(service, corev1.EventTypeWarning, "DeletingLoadBalancerFailed", msg)
+		// Return the first error or a combined error message
+		return fmt.Errorf("load balancer deletion completed with errors: %v", deletionErrors[0])
+	}
+
+	msg := fmt.Sprintf("Successfully deleted load balancer for service %s", serviceName)
+	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "DeletedLoadBalancer", msg)
+	klog.Info(msg)
 
 	return nil
+}
+
+// shouldReleaseLoadBalancerIP determines whether the public IP should be released
+func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (bool, error) {
+	// If the IP was explicitly specified in the service spec, don't release it
+	// The user is responsible for managing the lifecycle of user-provided IPs
+	if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP == lb.ipAddr {
+		klog.V(4).Infof("IP %v was explicitly specified in service spec, not releasing", lb.ipAddr)
+		return false, nil
+	}
+
+	// Check if this IP is used by other load balancer rules (other services)
+	p := lb.LoadBalancer.NewListLoadBalancerRulesParams()
+	p.SetPublicipid(lb.ipAddrID)
+	p.SetListall(true)
+	if lb.projectID != "" {
+		p.SetProjectid(lb.projectID)
+	}
+
+	otherRules, err := lb.LoadBalancer.ListLoadBalancerRules(p)
+	if err != nil {
+		return false, fmt.Errorf("error checking for other load balancer rules using IP %v: %w", lb.ipAddr, err)
+	}
+
+	// If other rules exist, this IP is in use by other services
+	if otherRules.Count > 0 {
+		klog.V(4).Infof("IP %v has %d other load balancer rule(s) in use, not releasing", lb.ipAddr, otherRules.Count)
+		return false, nil
+	}
+
+	// IP is safe to release - it's either controller-allocated or no longer in use
+	klog.V(4).Infof("IP %v is no longer in use and safe to release", lb.ipAddr)
+	return true, nil
 }
 
 // GetLoadBalancerName returns the name of the LoadBalancer.
@@ -419,34 +552,46 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 }
 
 // verifyHosts verifies if all hosts belong to the same network, and returns the host ID's and network ID.
+// During rolling upgrades some nodes may not yet have a corresponding VM in CloudStack, so we tolerate
+// partial matches: as long as at least one node can be resolved we return the matched set and log
+// warnings for the nodes we could not find.
 func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	hostNames := map[string]bool{}
+	// providerVMIDs maps CloudStack VM IDs extracted from node.Spec.ProviderID
+	// so we can match by ID in addition to name.
+	providerVMIDs := map[string]bool{}
 	for _, node := range nodes {
 		// node.Name can be an FQDN as well, and CloudStack VM names aren't
 		// To match, we need to Split the domain part off here, if present
 		hostNames[strings.Split(strings.ToLower(node.Name), ".")[0]] = true
+
+		// Also extract the VM ID from the ProviderID for a more reliable match.
+		if node.Spec.ProviderID != "" {
+			if id, _, err := instanceIDFromProviderID(node.Spec.ProviderID); err == nil {
+				providerVMIDs[id] = true
+			}
+		}
 	}
 
-	p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
-	p.SetListall(true)
-	p.SetDetails([]string{"min", "nics"})
-
-	if cs.projectID != "" {
-		p.SetProjectid(cs.projectID)
-	}
-
-	l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
+	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
+	allVMs, err := cs.listAllVirtualMachines()
 	if err != nil {
 		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
 	}
 
 	var hostIDs []string
 	var networkID string
+	matchedNames := map[string]bool{}
+	var skippedNoNIC []string
 
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
-	for _, vm := range l.VirtualMachines {
-		if hostNames[strings.ToLower(vm.Name)] {
+	for _, vm := range allVMs {
+		nameMatch := hostNames[strings.ToLower(vm.Name)]
+		idMatch := providerVMIDs[vm.Id]
+		if nameMatch || idMatch {
 			if len(vm.Nic) == 0 {
+				klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", vm.Name, vm.Id)
+				skippedNoNIC = append(skippedNoNIC, vm.Name)
 				// Skip VM's without any active network interfaces. This happens during rollout f.e.
 				continue
 			}
@@ -456,14 +601,68 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 
 			networkID = vm.Nic[0].Networkid
 			hostIDs = append(hostIDs, vm.Id)
+			matchedNames[strings.ToLower(vm.Name)] = true
 		}
 	}
 
-	if len(hostIDs) == 0 || len(networkID) == 0 {
-		return nil, "", errors.New("none of the hosts matched the list of VMs retrieved from CS API")
+	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
+	var unmatchedNodes []string
+	for _, node := range nodes {
+		shortName := strings.Split(strings.ToLower(node.Name), ".")[0]
+		if !matchedNames[shortName] {
+			unmatchedNodes = append(unmatchedNodes, node.Name)
+		}
+	}
+	if len(unmatchedNodes) > 0 {
+		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(unmatchedNodes), unmatchedNodes)
+	}
+	if len(skippedNoNIC) > 0 {
+		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(skippedNoNIC), skippedNoNIC)
 	}
 
+	if len(hostIDs) == 0 || len(networkID) == 0 {
+		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
+			len(nodes), unmatchedNodes, skippedNoNIC)
+	}
+
+	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(hostIDs), len(nodes))
+
 	return hostIDs, networkID, nil
+}
+
+// listAllVirtualMachines retrieves all VMs using pagination to handle large projects.
+func (cs *CSCloud) listAllVirtualMachines() ([]*cloudstack.VirtualMachine, error) {
+	var allVMs []*cloudstack.VirtualMachine
+
+	page := 1
+	pageSize := 500
+
+	for {
+		p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
+		p.SetListall(true)
+		p.SetDetails([]string{"min", "nics"})
+		p.SetPage(page)
+		p.SetPagesize(pageSize)
+
+		if cs.projectID != "" {
+			p.SetProjectid(cs.projectID)
+		}
+
+		l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
+		if err != nil {
+			return nil, err
+		}
+
+		allVMs = append(allVMs, l.VirtualMachines...)
+
+		// If we got fewer results than the page size, we've reached the last page.
+		if len(l.VirtualMachines) < pageSize {
+			break
+		}
+		page++
+	}
+
+	return allVMs, nil
 }
 
 // hasLoadBalancerIP returns true if we have a load balancer address and ID.
@@ -486,6 +685,7 @@ func (lb *loadBalancer) getPublicIPAddress(loadBalancerIP string) error {
 
 	p := lb.Address.NewListPublicIpAddressesParams()
 	p.SetIpaddress(loadBalancerIP)
+	p.SetAllocatedonly(false)
 	p.SetListall(true)
 
 	if lb.projectID != "" {
@@ -498,11 +698,16 @@ func (lb *loadBalancer) getPublicIPAddress(loadBalancerIP string) error {
 	}
 
 	if l.Count != 1 {
-		return fmt.Errorf("could not find IP address %v", loadBalancerIP)
+		return fmt.Errorf("could not find IP address %v. Found %d addresses", loadBalancerIP, l.Count)
 	}
 
 	lb.ipAddr = l.PublicIpAddresses[0].Ipaddress
 	lb.ipAddrID = l.PublicIpAddresses[0].Id
+
+	// If the IP Address is not allocated then associate it
+	if l.PublicIpAddresses[0].Allocated == "" {
+		return lb.associatePublicIPAddress()
+	}
 
 	return nil
 }
@@ -531,6 +736,10 @@ func (lb *loadBalancer) associatePublicIPAddress() error {
 
 	if lb.projectID != "" {
 		p.SetProjectid(lb.projectID)
+	}
+
+	if lb.ipAddr != "" {
+		p.SetIpaddress(lb.ipAddr)
 	}
 
 	// Associate a new IP address

@@ -1,5 +1,7 @@
 /cloudstack-ccm
 /hack/tools/bin
+cloud-config
 .idea/
+.vscode/
 .tests/
 .tool-versions
