@@ -40,9 +40,9 @@ BIN_DIR ?= bin
 GO_INSTALL := ./hack/go_install.sh
 
 GOLANGCI_LINT_BIN := golangci-lint
-GOLANGCI_LINT_VER := v1.63.4
+GOLANGCI_LINT_VER := v2.7.2
 GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/$(GOLANGCI_LINT_BIN)-$(GOLANGCI_LINT_VER))
-GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/cmd/golangci-lint
+GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 
 ##@ Linting
 ## --------------------------------------
