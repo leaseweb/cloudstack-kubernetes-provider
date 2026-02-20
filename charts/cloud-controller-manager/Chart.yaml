@@ -2,8 +2,8 @@ apiVersion: v2
 name: cloud-controller-manager
 description: CloudStack Cloud Controller Manager Helm chart
 type: application
-version: 1.4.1
-appVersion: 1.6.1
+version: 1.4.2
+appVersion: 1.6.2
 sources:
   - https://github.com/Leaseweb/cloudstack-kubernetes-provider
 keywords:
