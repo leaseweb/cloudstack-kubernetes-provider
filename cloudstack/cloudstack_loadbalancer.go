@@ -96,7 +96,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 }
 
 // EnsureLoadBalancer creates a new load balancer, or updates the existing one. Returns the status of the balancer.
-func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) { //nolint:gocognit,gocyclo,nestif
+func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (status *corev1.LoadBalancerStatus, err error) { //nolint:gocognit,gocyclo,nestif,maintidx
 	klog.V(4).InfoS("EnsureLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
@@ -141,7 +141,6 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
-
 	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
 		// LoadBalancerIP was specified and it's different from the current IP
 		// Release the old IP first
@@ -161,8 +160,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 				// CloudStack sometimes reports deletes as "invalid value" when the entity is already gone.
 				if strings.Contains(delErr.Error(), "does not exist") || strings.Contains(delErr.Error(), "Invalid parameter id value") {
 					klog.V(4).Infof("Load balancer rule %s already removed, continuing: %v", oldRule.Name, delErr)
+
 					continue
 				}
+
 				return nil, delErr
 			}
 		}
@@ -172,11 +173,13 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 		if err := lb.releaseLoadBalancerIP(); err != nil {
 			klog.Errorf("attempt to release old load balancer IP failed: %s", err.Error())
+
 			return nil, fmt.Errorf("failed to release old load balancer IP: %w", err)
 		}
 
 		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
 			klog.Errorf("failed to allocate specified IP %v: %v", service.Spec.LoadBalancerIP, err)
+
 			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
 		}
 
@@ -339,6 +342,7 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	// If no rules exist, the load balancer doesn't exist - nothing to delete
 	if len(lb.rules) == 0 {
 		klog.V(4).Infof("No load balancer rules found for service, nothing to delete")
+
 		return nil
 	}
 
@@ -390,16 +394,17 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	}
 
 	// Delete the public IP address if appropriate
-	if lb.ipAddr != "" {
+	if lb.ipAddr != "" { //nolint:nestif
 		klog.V(4).Infof("Processing public IP deletion for load balancer: IP=%v, ID=%v", lb.ipAddr, lb.ipAddrID)
 
 		// Check if we should release the IP
 		shouldReleaseIP, err := cs.shouldReleaseLoadBalancerIP(lb, service)
-		if err != nil {
+		switch {
+		case err != nil:
 			err := fmt.Errorf("error determining if IP should be released: %w", err)
 			klog.Errorf("%v", err)
 			deletionErrors = append(deletionErrors, err)
-		} else if shouldReleaseIP {
+		case shouldReleaseIP:
 			klog.V(4).Infof("Releasing load balancer IP: %v", lb.ipAddr)
 			if err := lb.releaseLoadBalancerIP(); err != nil {
 				err := fmt.Errorf("error releasing load balancer IP %v: %w", lb.ipAddr, err)
@@ -410,7 +415,7 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 				cs.eventRecorder.Event(service, corev1.EventTypeNormal, "ReleasedLoadBalancerIP", msg)
 				klog.Info(msg)
 			}
-		} else {
+		default:
 			klog.V(4).Infof("Load balancer IP %v is in use by other services, keeping it allocated", lb.ipAddr)
 		}
 	}
@@ -420,23 +425,25 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 		msg := fmt.Sprintf("Encountered %d error(s) while deleting load balancer for service %s", len(deletionErrors), serviceName)
 		klog.Warningf("%s: %v", msg, deletionErrors)
 		cs.eventRecorder.Event(service, corev1.EventTypeWarning, "DeletingLoadBalancerFailed", msg)
+
 		// Return the first error or a combined error message
-		return fmt.Errorf("load balancer deletion completed with errors: %v", deletionErrors[0])
+		return fmt.Errorf("load balancer deletion completed with errors: %w", deletionErrors[0])
 	}
 
-	msg := fmt.Sprintf("Successfully deleted load balancer for service %s", serviceName)
+	msg := "Successfully deleted load balancer for service " + serviceName
 	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "DeletedLoadBalancer", msg)
 	klog.Info(msg)
 
 	return nil
 }
 
-// shouldReleaseLoadBalancerIP determines whether the public IP should be released
+// shouldReleaseLoadBalancerIP determines whether the public IP should be released.
 func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (bool, error) {
 	// If the IP was explicitly specified in the service spec, don't release it
 	// The user is responsible for managing the lifecycle of user-provided IPs
 	if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP == lb.ipAddr {
 		klog.V(4).Infof("IP %v was explicitly specified in service spec, not releasing", lb.ipAddr)
+
 		return false, nil
 	}
 
@@ -456,11 +463,13 @@ func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1
 	// If other rules exist, this IP is in use by other services
 	if otherRules.Count > 0 {
 		klog.V(4).Infof("IP %v has %d other load balancer rule(s) in use, not releasing", lb.ipAddr, otherRules.Count)
+
 		return false, nil
 	}
 
 	// IP is safe to release - it's either controller-allocated or no longer in use
 	klog.V(4).Infof("IP %v is no longer in use and safe to release", lb.ipAddr)
+
 	return true, nil
 }
 
