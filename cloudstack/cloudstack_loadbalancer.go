@@ -142,7 +142,13 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
 	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
-		// LoadBalancerIP was specified and it's different from the current IP
+		// LoadBalancerIP was specified and it's different from the current IP.
+		// Validate the target IP exists before tearing down the old config to avoid
+		// leaving the service in a broken state if the new IP is invalid.
+		if err := lb.validatePublicIPAvailable(service.Spec.LoadBalancerIP); err != nil {
+			return nil, fmt.Errorf("cannot switch load balancer to IP %s: %w", service.Spec.LoadBalancerIP, err)
+		}
+
 		// Release the old IP first
 		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, service.Spec.LoadBalancerIP)
 
@@ -669,6 +675,31 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 	}
 
 	return lb.associatePublicIPAddress()
+}
+
+// validatePublicIPAvailable checks that the given IP address exists in CloudStack
+// without modifying any load balancer state. Used as a pre-flight check before
+// tearing down an existing configuration.
+func (lb *loadBalancer) validatePublicIPAvailable(ip string) error {
+	p := lb.Address.NewListPublicIpAddressesParams()
+	p.SetIpaddress(ip)
+	p.SetAllocatedonly(false)
+	p.SetListall(true)
+
+	if lb.projectID != "" {
+		p.SetProjectid(lb.projectID)
+	}
+
+	l, err := lb.Address.ListPublicIpAddresses(p)
+	if err != nil {
+		return fmt.Errorf("error looking up IP address %v: %w", ip, err)
+	}
+
+	if l.Count != 1 {
+		return fmt.Errorf("IP address %v not found (got %d results)", ip, l.Count)
+	}
+
+	return nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.
