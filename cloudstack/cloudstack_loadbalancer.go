@@ -149,7 +149,13 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
 		for _, oldRule := range lb.rules {
 			proto := ProtocolFromLoadBalancer(oldRule.Protocol)
+			if proto == LoadBalancerProtocolInvalid {
+				klog.Warningf("Skipping firewall cleanup for rule %s: unrecognized protocol %q", oldRule.Name, oldRule.Protocol)
+			}
 			port64, pErr := strconv.ParseInt(oldRule.Publicport, 10, 32)
+			if pErr != nil {
+				klog.Warningf("Skipping firewall cleanup for rule %s: cannot parse port %q: %v", oldRule.Name, oldRule.Publicport, pErr)
+			}
 			if proto != LoadBalancerProtocolInvalid && pErr == nil {
 				if _, fwErr := lb.deleteFirewallRule(oldRule.Publicipid, int(port64), proto); fwErr != nil {
 					klog.V(4).Infof("Ignoring firewall rule delete error for %s: %v", oldRule.Name, fwErr)
@@ -933,6 +939,10 @@ func symmetricDifference(hostIDs []string, lbInstances []*cloudstack.VirtualMach
 
 	var remove []string //nolint:prealloc
 	for _, instance := range lbInstances {
+		if instance == nil {
+			continue
+		}
+
 		if newIDs[instance.Id] {
 			delete(newIDs, instance.Id)
 
@@ -1088,12 +1098,13 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	// delete all other rules that didn't match the CIDR list
 	// do this first to prevent CS rule conflict errors
 	klog.V(4).Infof("Firewall rules to be deleted for %v: %v", lb.ipAddr, rulesMapToString(filtered))
+	var deleteErr error
 	for rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
-		_, err = lb.Firewall.DeleteFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.DeleteFirewallRule(p); err != nil {
 			// report the error, but keep on deleting the other rules
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			deleteErr = err
 		}
 	}
 
@@ -1104,15 +1115,15 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 		p.SetCidrlist(allowedCIDRs)
 		p.SetStartport(publicPort)
 		p.SetEndport(publicPort)
-		_, err = lb.Firewall.CreateFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.CreateFirewallRule(p); err != nil {
 			// return immediately if we can't create the new rule
 			return false, fmt.Errorf("error creating new firewall rule for public IP %v, proto %v, port %v, allowed %v: %w", publicIPID, protocol, publicPort, allowedCIDRs, err)
 		}
 	}
 
-	// return true (because we changed something), but also the last error if deleting one old rule failed
-	return true, err
+	changed := match == nil || len(filtered) > 0
+
+	return changed, deleteErr
 }
 
 // deleteFirewallRule deletes the firewall rule associated with the ip:port:protocol combo

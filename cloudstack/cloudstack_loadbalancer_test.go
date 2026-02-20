@@ -1952,8 +1952,8 @@ func TestUpdateFirewallRule(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !updated {
-			t.Errorf("updated = false, want true")
+		if updated {
+			t.Errorf("updated = true, want false (nothing changed)")
 		}
 	})
 
@@ -2159,9 +2159,12 @@ func TestUpdateFirewallRule(t *testing.T) {
 		}
 
 		updated, err := lb.updateFirewallRule("ip-123", 80, LoadBalancerProtocolTCP, []string{"10.0.0.0/8"})
-		// Should still return true even if delete failed
-		if err != nil && !strings.Contains(err.Error(), "error creating") {
-			t.Fatalf("unexpected error: %v", err)
+		// Should still return true even if delete failed, but the deletion error should be surfaced
+		if err == nil {
+			t.Fatalf("expected deletion error to be returned, got nil")
+		}
+		if !strings.Contains(err.Error(), "delete API error") {
+			t.Fatalf("expected deletion error, got: %v", err)
 		}
 		if !updated {
 			t.Errorf("updated = false, want true")
