@@ -2741,3 +2741,166 @@ func TestVerifyHosts(t *testing.T) {
 		}
 	})
 }
+
+func TestReconcileHostsForRule(t *testing.T) {
+	t.Run("hosts already correct - no-op", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+			Count: 2,
+			LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+				{Id: "vm-1"},
+				{Id: "vm-2"},
+			},
+		}, nil)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1", "vm-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing hosts get assigned", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count:                     0,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{},
+			}, nil),
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil),
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1", "vm-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("stale hosts removed and new hosts assigned", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+		removeParams := &cloudstack.RemoveFromLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count: 2,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+					{Id: "vm-old-1"},
+					{Id: "vm-old-2"},
+				},
+			}, nil),
+			// Assign new hosts BEFORE removing old ones
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil),
+			mockLB.EXPECT().NewRemoveFromLoadBalancerRuleParams("rule-1").Return(removeParams),
+			mockLB.EXPECT().RemoveFromLoadBalancerRule(gomock.Any()).Return(&cloudstack.RemoveFromLoadBalancerRuleResponse{}, nil),
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-new-1", "vm-new-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("assign failure preserves old hosts", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count: 1,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+					{Id: "vm-old"},
+				},
+			}, nil),
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(nil, fmt.Errorf("assign API error")),
+			// removeHostsFromRule should NOT be called because assign failed
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-new"})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if !strings.Contains(err.Error(), "old hosts preserved") {
+			t.Errorf("error message = %q, want to contain 'old hosts preserved'", err.Error())
+		}
+	})
+
+	t.Run("list instances error", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(nil, fmt.Errorf("API error"))
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1"})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if !strings.Contains(err.Error(), "error retrieving associated instances") {
+			t.Errorf("error message = %q, want to contain 'error retrieving associated instances'", err.Error())
+		}
+	})
+}

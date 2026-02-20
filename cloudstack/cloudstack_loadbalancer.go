@@ -211,13 +211,16 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 				if err := lb.updateLoadBalancerRule(lbRuleName, protocol); err != nil {
 					return nil, err
 				}
-				// Delete the rule from the map, to prevent it being deleted.
-				delete(lb.rules, lbRuleName)
 			} else {
 				klog.V(4).Infof("Load balancer rule %v is up-to-date", lbRuleName)
-				// Delete the rule from the map, to prevent it being deleted.
-				delete(lb.rules, lbRuleName)
 			}
+
+			if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
+				return nil, err
+			}
+
+			// Delete the rule from the map, to prevent it being deleted.
+			delete(lb.rules, lbRuleName)
 		} else {
 			klog.V(4).Infof("Creating load balancer rule: %v", lbRuleName)
 			lbRule, err = lb.createLoadBalancerRule(lbRuleName, port, protocol)
@@ -301,34 +304,8 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	for _, lbRule := range lb.rules {
-		p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
-
-		// Retrieve all VMs currently associated to this load balancer rule.
-		l, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
-		if err != nil {
-			return fmt.Errorf("error retrieving associated instances: %w", err)
-		}
-
-		assign, remove := symmetricDifference(lb.hostIDs, l.LoadBalancerRuleInstances)
-
-		klog.V(4).Infof("Load balancer rule %v: %d host(s) to assign, %d host(s) to remove (wanted: %v, current: %d instances)",
-			lbRule.Name, len(assign), len(remove), lb.hostIDs, len(l.LoadBalancerRuleInstances))
-
-		// IMPORTANT: Assign new hosts BEFORE removing old ones to ensure the load balancer
-		// always has backends during rolling upgrades. If assignment fails, we abort without
-		// removing old hosts so traffic can still be served.
-		if len(assign) > 0 {
-			klog.V(4).Infof("Assigning new hosts (%v) to load balancer rule: %v", assign, lbRule.Name)
-			if err := lb.assignHostsToRule(lbRule, assign); err != nil {
-				return fmt.Errorf("error assigning new hosts to rule %v (old hosts preserved): %w", lbRule.Name, err)
-			}
-		}
-
-		if len(remove) > 0 {
-			klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", remove, lbRule.Name)
-			if err := lb.removeHostsFromRule(lbRule, remove); err != nil {
-				return err
-			}
+		if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
+			return err
 		}
 	}
 
@@ -851,6 +828,39 @@ func (lb *loadBalancer) deleteLoadBalancerRule(lbRule *cloudstack.LoadBalancerRu
 
 	// Delete the rule from the map as it no longer exists
 	delete(lb.rules, lbRule.Name)
+
+	return nil
+}
+
+// reconcileHostsForRule ensures the load balancer rule has exactly the expected set of hosts.
+// It lists the current members, computes the difference, and assigns new hosts before removing
+// old ones so the rule always has backends during rolling upgrades.
+func (lb *loadBalancer) reconcileHostsForRule(lbRule *cloudstack.LoadBalancerRule, hostIDs []string) error {
+	p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
+
+	l, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
+	if err != nil {
+		return fmt.Errorf("error retrieving associated instances: %w", err)
+	}
+
+	assign, remove := symmetricDifference(hostIDs, l.LoadBalancerRuleInstances)
+
+	klog.V(4).Infof("Reconcile hosts for rule %v: %d host(s) to assign, %d host(s) to remove (wanted: %v, current: %d instances)",
+		lbRule.Name, len(assign), len(remove), hostIDs, len(l.LoadBalancerRuleInstances))
+
+	if len(assign) > 0 {
+		klog.V(4).Infof("Assigning new hosts (%v) to load balancer rule: %v", assign, lbRule.Name)
+		if err := lb.assignHostsToRule(lbRule, assign); err != nil {
+			return fmt.Errorf("error assigning new hosts to rule %v (old hosts preserved): %w", lbRule.Name, err)
+		}
+	}
+
+	if len(remove) > 0 {
+		klog.V(4).Infof("Removing old hosts (%v) from load balancer rule: %v", remove, lbRule.Name)
+		if err := lb.removeHostsFromRule(lbRule, remove); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
