@@ -32,7 +32,7 @@ var providerIDRegexp = regexp.MustCompile(`^` + ProviderName + `://([^/]*)/([^/]
 // A providerID is build out of '${ProviderName}:///${instance-id}' which contains ':///'.
 // or '${ProviderName}://${region}/${instance-id}' which contains '://'.
 // See cloudprovider.GetInstanceProviderID and Instances.InstanceID.
-func instanceIDFromProviderID(providerID string) (instanceID string, region string, err error) {
+func instanceIDFromProviderID(providerID string) (instanceID string, region string, err error) { //nolint:unparam
 	// https://github.com/kubernetes/kubernetes/issues/85731
 	if providerID != "" && !strings.Contains(providerID, "://") {
 		providerID = ProviderName + "://" + providerID
