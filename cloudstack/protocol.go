@@ -87,9 +87,9 @@ func ProtocolFromServicePort(port corev1.ServicePort, service *corev1.Service) L
 	case corev1.ProtocolTCP:
 		if proxy {
 			return LoadBalancerProtocolTCPProxy
-		} else {
-			return LoadBalancerProtocolTCP
 		}
+
+		return LoadBalancerProtocolTCP
 	case corev1.ProtocolUDP:
 		return LoadBalancerProtocolUDP
 	default:

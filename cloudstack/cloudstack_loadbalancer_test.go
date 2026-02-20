@@ -20,7 +20,7 @@
 package cloudstack
 
 import (
-	"fmt"
+	"errors"
 	"sort"
 	"strings"
 	"testing"
@@ -495,7 +495,6 @@ func TestCheckLoadBalancerRule(t *testing.T) {
 			t.Fatalf("expected rule entry to be removed from map")
 		}
 	})
-
 }
 
 func TestRuleToString(t *testing.T) {
@@ -727,6 +726,7 @@ func TestRulesMapToString(t *testing.T) {
 				parts := strings.Split(got, ", ")
 				if len(parts) != len(expectedRules) {
 					t.Errorf("rulesMapToString() returned %d rules, want %d", len(parts), len(expectedRules))
+
 					return
 				}
 				for _, expectedRule := range expectedRules {
@@ -734,6 +734,7 @@ func TestRulesMapToString(t *testing.T) {
 					for _, part := range parts {
 						if part == expectedRule {
 							found = true
+
 							break
 						}
 					}
@@ -741,6 +742,7 @@ func TestRulesMapToString(t *testing.T) {
 						t.Errorf("rulesMapToString() missing rule %q in output %q", expectedRule, got)
 					}
 				}
+
 				return
 			}
 
@@ -922,7 +924,7 @@ func TestGetPublicIPAddress(t *testing.T) {
 
 		mockAddress := cloudstack.NewMockAddressServiceIface(ctrl)
 		listParams := &cloudstack.ListPublicIpAddressesParams{}
-		apiErr := fmt.Errorf("API error")
+		apiErr := errors.New("API error")
 
 		gomock.InOrder(
 			mockAddress.EXPECT().NewListPublicIpAddressesParams().Return(listParams),
@@ -1080,7 +1082,7 @@ func TestAssociatePublicIPAddress(t *testing.T) {
 		t.Cleanup(ctrl.Finish)
 
 		mockNetwork := cloudstack.NewMockNetworkServiceIface(ctrl)
-		apiErr := fmt.Errorf("network API error")
+		apiErr := errors.New("network API error")
 
 		mockNetwork.EXPECT().GetNetworkByID("net-123", gomock.Any()).Return(nil, 1, apiErr)
 
@@ -1106,7 +1108,7 @@ func TestAssociatePublicIPAddress(t *testing.T) {
 
 		mockNetwork := cloudstack.NewMockNetworkServiceIface(ctrl)
 
-		mockNetwork.EXPECT().GetNetworkByID("net-123", gomock.Any()).Return(nil, 0, fmt.Errorf("not found"))
+		mockNetwork.EXPECT().GetNetworkByID("net-123", gomock.Any()).Return(nil, 0, errors.New("not found"))
 
 		lb := &loadBalancer{
 			CloudStackClient: &cloudstack.CloudStackClient{
@@ -1137,7 +1139,7 @@ func TestAssociatePublicIPAddress(t *testing.T) {
 		}
 
 		associateParams := &cloudstack.AssociateIpAddressParams{}
-		apiErr := fmt.Errorf("associate API error")
+		apiErr := errors.New("associate API error")
 
 		gomock.InOrder(
 			mockNetwork.EXPECT().GetNetworkByID("net-123", gomock.Any()).Return(networkResp, 1, nil),
@@ -1235,7 +1237,7 @@ func TestReleaseLoadBalancerIP(t *testing.T) {
 
 		mockAddress := cloudstack.NewMockAddressServiceIface(ctrl)
 		disassociateParams := &cloudstack.DisassociateIpAddressParams{}
-		apiErr := fmt.Errorf("disassociate API error")
+		apiErr := errors.New("disassociate API error")
 
 		gomock.InOrder(
 			mockAddress.EXPECT().NewDisassociateIpAddressParams("ip-123").Return(disassociateParams),
@@ -1510,7 +1512,7 @@ func TestCreateLoadBalancerRule(t *testing.T) {
 
 		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
 		createParams := &cloudstack.CreateLoadBalancerRuleParams{}
-		apiErr := fmt.Errorf("create rule API error")
+		apiErr := errors.New("create rule API error")
 
 		gomock.InOrder(
 			mockLB.EXPECT().NewCreateLoadBalancerRuleParams("roundrobin", "test-rule-tcp-80", 30000, 80).Return(createParams),
@@ -1653,7 +1655,7 @@ func TestDeleteLoadBalancerRule(t *testing.T) {
 
 		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
 		deleteParams := &cloudstack.DeleteLoadBalancerRuleParams{}
-		apiErr := fmt.Errorf("delete rule API error")
+		apiErr := errors.New("delete rule API error")
 
 		gomock.InOrder(
 			mockLB.EXPECT().NewDeleteLoadBalancerRuleParams("rule-123").Return(deleteParams),
@@ -1723,7 +1725,7 @@ func TestAssignHostsToRule(t *testing.T) {
 
 		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
 		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
-		apiErr := fmt.Errorf("assign API error")
+		apiErr := errors.New("assign API error")
 
 		gomock.InOrder(
 			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-123").Return(assignParams),
@@ -1816,7 +1818,7 @@ func TestRemoveHostsFromRule(t *testing.T) {
 
 		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
 		removeParams := &cloudstack.RemoveFromLoadBalancerRuleParams{}
-		apiErr := fmt.Errorf("remove API error")
+		apiErr := errors.New("remove API error")
 
 		gomock.InOrder(
 			mockLB.EXPECT().NewRemoveFromLoadBalancerRuleParams("rule-123").Return(removeParams),
@@ -2052,7 +2054,7 @@ func TestUpdateFirewallRule(t *testing.T) {
 
 		mockFirewall := cloudstack.NewMockFirewallServiceIface(ctrl)
 		listParams := &cloudstack.ListFirewallRulesParams{}
-		apiErr := fmt.Errorf("list API error")
+		apiErr := errors.New("list API error")
 
 		gomock.InOrder(
 			mockFirewall.EXPECT().NewListFirewallRulesParams().Return(listParams),
@@ -2087,7 +2089,7 @@ func TestUpdateFirewallRule(t *testing.T) {
 		}
 
 		createParams := &cloudstack.CreateFirewallRuleParams{}
-		apiErr := fmt.Errorf("create API error")
+		apiErr := errors.New("create API error")
 
 		gomock.InOrder(
 			mockFirewall.EXPECT().NewListFirewallRulesParams().Return(listParams),
@@ -2134,7 +2136,7 @@ func TestUpdateFirewallRule(t *testing.T) {
 		}
 
 		deleteParams := &cloudstack.DeleteFirewallRuleParams{}
-		deleteErr := fmt.Errorf("delete API error")
+		deleteErr := errors.New("delete API error")
 		createParams := &cloudstack.CreateFirewallRuleParams{}
 		createResp := &cloudstack.CreateFirewallRuleResponse{
 			Id: "fw-124",
@@ -2248,7 +2250,7 @@ func TestDeleteFirewallRule(t *testing.T) {
 
 		mockFirewall := cloudstack.NewMockFirewallServiceIface(ctrl)
 		listParams := &cloudstack.ListFirewallRulesParams{}
-		apiErr := fmt.Errorf("list API error")
+		apiErr := errors.New("list API error")
 
 		gomock.InOrder(
 			mockFirewall.EXPECT().NewListFirewallRulesParams().Return(listParams),
@@ -2290,7 +2292,7 @@ func TestDeleteFirewallRule(t *testing.T) {
 		}
 
 		deleteParams := &cloudstack.DeleteFirewallRuleParams{}
-		deleteErr := fmt.Errorf("delete API error")
+		deleteErr := errors.New("delete API error")
 
 		gomock.InOrder(
 			mockFirewall.EXPECT().NewListFirewallRulesParams().Return(listParams),
@@ -2310,7 +2312,7 @@ func TestDeleteFirewallRule(t *testing.T) {
 		if deleted {
 			t.Errorf("deleted = true, want false")
 		}
-		if err != deleteErr {
+		if !errors.Is(err, deleteErr) {
 			t.Errorf("error = %v, want %v", err, deleteErr)
 		}
 	})
@@ -2738,6 +2740,169 @@ func TestVerifyHosts(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "could not match any") {
 			t.Errorf("error message = %q, want to contain 'could not match any'", err.Error())
+		}
+	})
+}
+
+func TestReconcileHostsForRule(t *testing.T) {
+	t.Run("hosts already correct - no-op", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+			Count: 2,
+			LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+				{Id: "vm-1"},
+				{Id: "vm-2"},
+			},
+		}, nil)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1", "vm-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing hosts get assigned", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count:                     0,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{},
+			}, nil),
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil),
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1", "vm-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("stale hosts removed and new hosts assigned", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+		removeParams := &cloudstack.RemoveFromLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count: 2,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+					{Id: "vm-old-1"},
+					{Id: "vm-old-2"},
+				},
+			}, nil),
+			// Assign new hosts BEFORE removing old ones
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil),
+			mockLB.EXPECT().NewRemoveFromLoadBalancerRuleParams("rule-1").Return(removeParams),
+			mockLB.EXPECT().RemoveFromLoadBalancerRule(gomock.Any()).Return(&cloudstack.RemoveFromLoadBalancerRuleResponse{}, nil),
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-new-1", "vm-new-2"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("assign failure preserves old hosts", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+		assignParams := &cloudstack.AssignToLoadBalancerRuleParams{}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams),
+			mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count: 1,
+				LoadBalancerRuleInstances: []*cloudstack.VirtualMachine{
+					{Id: "vm-old"},
+				},
+			}, nil),
+			mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(assignParams),
+			mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(nil, errors.New("assign API error")),
+			// removeHostsFromRule should NOT be called because assign failed
+		)
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-new"})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if !strings.Contains(err.Error(), "old hosts preserved") {
+			t.Errorf("error message = %q, want to contain 'old hosts preserved'", err.Error())
+		}
+	})
+
+	t.Run("list instances error", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRuleInstancesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(nil, errors.New("API error"))
+
+		lb := &loadBalancer{
+			CloudStackClient: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		rule := &cloudstack.LoadBalancerRule{Id: "rule-1", Name: "test-rule"}
+		err := lb.reconcileHostsForRule(rule, []string{"vm-1"})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if !strings.Contains(err.Error(), "error retrieving associated instances") {
+			t.Errorf("error message = %q, want to contain 'error retrieving associated instances'", err.Error())
 		}
 	})
 }
