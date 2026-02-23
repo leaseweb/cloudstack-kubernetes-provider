@@ -252,10 +252,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
 		if err != nil {
 			if count == 0 {
-				return nil, err
+				return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
 			}
 
-			return nil, err
+			return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
 		}
 
 		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
@@ -648,7 +648,7 @@ func (cs *CSCloud) listAllVirtualMachines() ([]*cloudstack.VirtualMachine, error
 
 		l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list virtual machines: %w", err)
 		}
 
 		allVMs = append(allVMs, l.VirtualMachines...)
@@ -821,8 +821,11 @@ func (lb *loadBalancer) updateLoadBalancerRule(lbRuleName string, protocol LoadB
 	p.SetProtocol(protocol.CSProtocol())
 
 	_, err := lb.LoadBalancer.UpdateLoadBalancerRule(p)
+	if err != nil {
+		return fmt.Errorf("failed to update loadbalancer rule with ID %s: %w", lbRule.Id, err)
+	}
 
-	return err
+	return nil
 }
 
 // createLoadBalancerRule creates a new load balancer rule and returns its ID.
@@ -1181,18 +1184,20 @@ func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, pr
 	}
 
 	// delete all rules
+	var errs error
 	deleted := false
 	for _, rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
 		_, err = lb.Firewall.DeleteFirewallRule(p)
 		if err != nil {
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			errs = errors.Join(errs, fmt.Errorf("error deleting old firewall rule %v: %w", rule.Id, err))
 		} else {
 			deleted = true
 		}
 	}
 
-	return deleted, err
+	return deleted, errs
 }
 
 // getLoadBalancerSourceRanges first tries to parse and verify loadBalancerSourceRanges field from a Service object.
