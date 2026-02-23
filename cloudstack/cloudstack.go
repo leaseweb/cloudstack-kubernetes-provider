@@ -98,7 +98,7 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 	}
 
 	if cs.client == nil {
-		return nil, errors.New("no cloud provider config given")
+		return nil, errors.New("cloud provider configuration incomplete: api-url, api-key, and secret-key are all required")
 	}
 
 	return cs, nil

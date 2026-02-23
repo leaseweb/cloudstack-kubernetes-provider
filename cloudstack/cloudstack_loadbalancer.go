@@ -142,14 +142,26 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
 	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
-		// LoadBalancerIP was specified and it's different from the current IP
+		// LoadBalancerIP was specified and it's different from the current IP.
+		// Validate the target IP exists before tearing down the old config to avoid
+		// leaving the service in a broken state if the new IP is invalid.
+		if err := lb.validatePublicIPAvailable(service.Spec.LoadBalancerIP); err != nil {
+			return nil, fmt.Errorf("cannot switch load balancer to IP %s: %w", service.Spec.LoadBalancerIP, err)
+		}
+
 		// Release the old IP first
 		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, service.Spec.LoadBalancerIP)
 
 		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
 		for _, oldRule := range lb.rules {
 			proto := ProtocolFromLoadBalancer(oldRule.Protocol)
+			if proto == LoadBalancerProtocolInvalid {
+				klog.Warningf("Skipping firewall cleanup for rule %s: unrecognized protocol %q", oldRule.Name, oldRule.Protocol)
+			}
 			port64, pErr := strconv.ParseInt(oldRule.Publicport, 10, 32)
+			if pErr != nil {
+				klog.Warningf("Skipping firewall cleanup for rule %s: cannot parse port %q: %v", oldRule.Name, oldRule.Publicport, pErr)
+			}
 			if proto != LoadBalancerProtocolInvalid && pErr == nil {
 				if _, fwErr := lb.deleteFirewallRule(oldRule.Publicipid, int(port64), proto); fwErr != nil {
 					klog.V(4).Infof("Ignoring firewall rule delete error for %s: %v", oldRule.Name, fwErr)
@@ -240,10 +252,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
 		if err != nil {
 			if count == 0 {
-				return nil, err
+				return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
 			}
 
-			return nil, err
+			return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
 		}
 
 		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
@@ -636,7 +648,7 @@ func (cs *CSCloud) listAllVirtualMachines() ([]*cloudstack.VirtualMachine, error
 
 		l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list virtual machines: %w", err)
 		}
 
 		allVMs = append(allVMs, l.VirtualMachines...)
@@ -663,6 +675,31 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 	}
 
 	return lb.associatePublicIPAddress()
+}
+
+// validatePublicIPAvailable checks that the given IP address exists in CloudStack
+// without modifying any load balancer state. Used as a pre-flight check before
+// tearing down an existing configuration.
+func (lb *loadBalancer) validatePublicIPAvailable(ip string) error {
+	p := lb.Address.NewListPublicIpAddressesParams()
+	p.SetIpaddress(ip)
+	p.SetAllocatedonly(false)
+	p.SetListall(true)
+
+	if lb.projectID != "" {
+		p.SetProjectid(lb.projectID)
+	}
+
+	l, err := lb.Address.ListPublicIpAddresses(p)
+	if err != nil {
+		return fmt.Errorf("error looking up IP address %v: %w", ip, err)
+	}
+
+	if l.Count != 1 {
+		return fmt.Errorf("IP address %v not found (got %d results)", ip, l.Count)
+	}
+
+	return nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.
@@ -784,8 +821,11 @@ func (lb *loadBalancer) updateLoadBalancerRule(lbRuleName string, protocol LoadB
 	p.SetProtocol(protocol.CSProtocol())
 
 	_, err := lb.LoadBalancer.UpdateLoadBalancerRule(p)
+	if err != nil {
+		return fmt.Errorf("failed to update loadbalancer rule with ID %s: %w", lbRule.Id, err)
+	}
 
-	return err
+	return nil
 }
 
 // createLoadBalancerRule creates a new load balancer rule and returns its ID.
@@ -933,6 +973,10 @@ func symmetricDifference(hostIDs []string, lbInstances []*cloudstack.VirtualMach
 
 	var remove []string //nolint:prealloc
 	for _, instance := range lbInstances {
+		if instance == nil {
+			continue
+		}
+
 		if newIDs[instance.Id] {
 			delete(newIDs, instance.Id)
 
@@ -1088,12 +1132,13 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	// delete all other rules that didn't match the CIDR list
 	// do this first to prevent CS rule conflict errors
 	klog.V(4).Infof("Firewall rules to be deleted for %v: %v", lb.ipAddr, rulesMapToString(filtered))
+	var deleteErr error
 	for rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
-		_, err = lb.Firewall.DeleteFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.DeleteFirewallRule(p); err != nil {
 			// report the error, but keep on deleting the other rules
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			deleteErr = err
 		}
 	}
 
@@ -1104,15 +1149,15 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 		p.SetCidrlist(allowedCIDRs)
 		p.SetStartport(publicPort)
 		p.SetEndport(publicPort)
-		_, err = lb.Firewall.CreateFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.CreateFirewallRule(p); err != nil {
 			// return immediately if we can't create the new rule
 			return false, fmt.Errorf("error creating new firewall rule for public IP %v, proto %v, port %v, allowed %v: %w", publicIPID, protocol, publicPort, allowedCIDRs, err)
 		}
 	}
 
-	// return true (because we changed something), but also the last error if deleting one old rule failed
-	return true, err
+	changed := match == nil || len(filtered) > 0
+
+	return changed, deleteErr
 }
 
 // deleteFirewallRule deletes the firewall rule associated with the ip:port:protocol combo
@@ -1139,18 +1184,20 @@ func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, pr
 	}
 
 	// delete all rules
+	var errs error
 	deleted := false
 	for _, rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
 		_, err = lb.Firewall.DeleteFirewallRule(p)
 		if err != nil {
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			errs = errors.Join(errs, fmt.Errorf("error deleting old firewall rule %v: %w", rule.Id, err))
 		} else {
 			deleted = true
 		}
 	}
 
-	return deleted, err
+	return deleted, errs
 }
 
 // getLoadBalancerSourceRanges first tries to parse and verify loadBalancerSourceRanges field from a Service object.
