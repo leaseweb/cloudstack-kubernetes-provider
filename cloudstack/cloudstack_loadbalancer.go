@@ -133,9 +133,49 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	if !lb.hasLoadBalancerIP() { //nolint:nestif
-		// Create or retrieve the load balancer IP.
-		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			return nil, err
+		// Before allocating a new IP, check the service annotation for a previously assigned IP.
+		// This handles recovery from partial failures where the IP was allocated and annotated
+		// but subsequent operations (rule creation, IP switch) failed.
+		annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
+		if annotatedIP != "" {
+			specIP := service.Spec.LoadBalancerIP
+			if specIP == "" || specIP == annotatedIP {
+				// Case 1: Auto-allocated IP recovery — the annotated IP is the one we want.
+				found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+				if lookupErr != nil {
+					klog.Warningf("Error looking up annotated IP %v for recovery: %v", annotatedIP, lookupErr)
+				} else if found {
+					klog.V(4).Infof("Recovered previously allocated IP %v from annotation", annotatedIP)
+				}
+			} else {
+				// Case 2: IP switch retry — annotation holds old IP that failed to release.
+				klog.V(4).Infof("Detected IP switch retry: annotation has %v, spec wants %v; attempting cleanup of old IP", annotatedIP, specIP)
+				oldFound, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+				if lookupErr != nil {
+					klog.Warningf("Error looking up old annotated IP %v during IP switch cleanup: %v", annotatedIP, lookupErr)
+				} else if oldFound {
+					shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
+					if shouldErr != nil {
+						klog.Warningf("Error checking if old IP %v should be released: %v", annotatedIP, shouldErr)
+					} else if shouldRelease {
+						if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
+							klog.Warningf("Best-effort release of old IP %v failed: %v", annotatedIP, releaseErr)
+						} else {
+							klog.Infof("Released old IP %v during IP switch retry", annotatedIP)
+						}
+					}
+				}
+				// Reset so we fall through to allocate the new IP
+				lb.ipAddr = ""
+				lb.ipAddrID = ""
+			}
+		}
+
+		if !lb.hasLoadBalancerIP() {
+			// Create or retrieve the load balancer IP.
+			if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
+				return nil, err
+			}
 		}
 
 		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
@@ -351,11 +391,12 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 		return err
 	}
 
-	// If no rules exist, the load balancer doesn't exist - nothing to delete
+	// If no rules exist, the load balancer doesn't exist. However, an IP may have been
+	// orphaned from a previous partial failure. Check the service annotation for cleanup.
 	if len(lb.rules) == 0 {
-		klog.V(4).Infof("No load balancer rules found for service, nothing to delete")
+		klog.V(4).Infof("No load balancer rules found for service, checking annotation for orphaned IP")
 
-		return nil
+		return cs.releaseOrphanedIPIfNeeded(lb, service)
 	}
 
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
@@ -485,6 +526,50 @@ func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1
 	return true, nil
 }
 
+// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
+// This handles the case where all LB rules were successfully deleted but IP release failed on a prior attempt.
+func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
+	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
+	if annotatedIP == "" {
+		return nil
+	}
+
+	found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+	if lookupErr != nil {
+		klog.Warningf("Error looking up annotated IP %v during delete: %v", annotatedIP, lookupErr)
+
+		return nil
+	}
+
+	if !found {
+		return nil
+	}
+
+	shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
+	if shouldErr != nil {
+		klog.Warningf("Error checking if annotated IP %v should be released: %v", annotatedIP, shouldErr)
+
+		return nil
+	}
+
+	if !shouldRelease {
+		klog.V(4).Infof("Annotated IP %v should not be released (user-specified or has other rules)", annotatedIP)
+
+		return nil
+	}
+
+	if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
+		return fmt.Errorf("error releasing orphaned load balancer IP %v: %w", annotatedIP, releaseErr)
+	}
+
+	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+	msg := fmt.Sprintf("Released orphaned load balancer IP %s for service %s", annotatedIP, serviceName)
+	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "ReleasedOrphanedIP", msg)
+	klog.Info(msg)
+
+	return nil
+}
+
 // GetLoadBalancerName returns the name of the LoadBalancer.
 func (cs *CSCloud) GetLoadBalancerName(_ context.Context, clusterName string, service *corev1.Service) string {
 	return Sprintf255(lbNameFormat, servicePrefix, clusterName, service.Namespace, service.Name)
@@ -493,6 +578,20 @@ func (cs *CSCloud) GetLoadBalancerName(_ context.Context, clusterName string, se
 // getLoadBalancerLegacyName returns the legacy load balancer name for backward compatibility.
 func (cs *CSCloud) getLoadBalancerLegacyName(_ context.Context, _ string, service *corev1.Service) string {
 	return cloudprovider.DefaultLoadBalancerName(service)
+}
+
+// filterRulesByPrefix returns only the rules whose Name starts with the given prefix.
+// This is needed because CloudStack's SetKeyword uses LIKE %keyword% matching,
+// which can return rules belonging to other services with overlapping name substrings.
+func filterRulesByPrefix(rules []*cloudstack.LoadBalancerRule, prefix string) []*cloudstack.LoadBalancerRule {
+	var filtered []*cloudstack.LoadBalancerRule
+	for _, rule := range rules {
+		if strings.HasPrefix(rule.Name, prefix) {
+			filtered = append(filtered, rule)
+		}
+	}
+
+	return filtered
 }
 
 // getLoadBalancerByName retrieves the IP address and ID and all the existing rules it can find.
@@ -517,23 +616,29 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 		return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
 	}
 
+	// Filter keyword results to exact prefix matches. CloudStack's SetKeyword uses
+	// LIKE %keyword% matching, so searching for "foo" can also return "foobar" rules.
+	filtered := filterRulesByPrefix(l.LoadBalancerRules, lb.name+"-")
+
 	// If no rules were found, check the legacy name.
-	if len(l.LoadBalancerRules) == 0 { //nolint:nestif
+	if len(filtered) == 0 { //nolint:nestif
 		if len(legacyName) > 0 {
 			p.SetKeyword(legacyName)
 			l, err = cs.client.LoadBalancer.ListLoadBalancerRules(p)
 			if err != nil {
 				return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
 			}
-			if len(l.LoadBalancerRules) > 0 {
+			legacyFiltered := filterRulesByPrefix(l.LoadBalancerRules, legacyName+"-")
+			if len(legacyFiltered) > 0 {
 				lb.name = legacyName
+				filtered = legacyFiltered
 			}
 		} else {
 			return lb, nil
 		}
 	}
 
-	for _, lbRule := range l.LoadBalancerRules {
+	for _, lbRule := range filtered {
 		lb.rules[lbRule.Name] = lbRule
 
 		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
@@ -700,6 +805,35 @@ func (lb *loadBalancer) validatePublicIPAvailable(ip string) error {
 	}
 
 	return nil
+}
+
+// lookupPublicIPAddress checks whether the given IP address is already allocated in CloudStack.
+// If found and allocated, it sets lb.ipAddr and lb.ipAddrID and returns (true, nil).
+// If not found or not allocated, it returns (false, nil) without modifying lb state.
+// Unlike getPublicIPAddress, this method does NOT call associatePublicIPAddress for unallocated IPs.
+func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
+	p := lb.Address.NewListPublicIpAddressesParams()
+	p.SetIpaddress(ip)
+	p.SetAllocatedonly(true)
+	p.SetListall(true)
+
+	if lb.projectID != "" {
+		p.SetProjectid(lb.projectID)
+	}
+
+	l, err := lb.Address.ListPublicIpAddresses(p)
+	if err != nil {
+		return false, fmt.Errorf("error looking up IP address %v: %w", ip, err)
+	}
+
+	if l.Count != 1 {
+		return false, nil
+	}
+
+	lb.ipAddr = l.PublicIpAddresses[0].Ipaddress
+	lb.ipAddrID = l.PublicIpAddresses[0].Id
+
+	return true, nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.
