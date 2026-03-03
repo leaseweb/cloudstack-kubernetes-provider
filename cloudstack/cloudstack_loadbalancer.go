@@ -144,38 +144,14 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	if !lb.hasLoadBalancerIP() { //nolint:nestif
 		// Before allocating a new IP, check the service annotation for a previously assigned IP.
 		// This handles recovery from partial failures where the IP was allocated and annotated
-		// but subsequent operations (rule creation, IP switch) failed.
+		// but subsequent operations (rule creation) failed.
 		annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
 		if annotatedIP != "" {
-			if desiredIP == "" || desiredIP == annotatedIP {
-				// Case 1: Auto-allocated IP recovery — the annotated IP is the one we want.
-				found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
-				if lookupErr != nil {
-					klog.Warningf("Error looking up annotated IP %v for recovery: %v", annotatedIP, lookupErr)
-				} else if found {
-					klog.V(4).Infof("Recovered previously allocated IP %v from annotation", annotatedIP)
-				}
-			} else {
-				// Case 2: IP switch retry — annotation holds old IP that failed to release.
-				klog.V(4).Infof("Detected IP switch retry: annotation has %v, desired is %v; attempting cleanup of old IP", annotatedIP, desiredIP)
-				oldFound, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
-				if lookupErr != nil {
-					klog.Warningf("Error looking up old annotated IP %v during IP switch cleanup: %v", annotatedIP, lookupErr)
-				} else if oldFound {
-					shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
-					if shouldErr != nil {
-						klog.Warningf("Error checking if old IP %v should be released: %v", annotatedIP, shouldErr)
-					} else if shouldRelease {
-						if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
-							klog.Warningf("Best-effort release of old IP %v failed: %v", annotatedIP, releaseErr)
-						} else {
-							klog.Infof("Released old IP %v during IP switch retry", annotatedIP)
-						}
-					}
-				}
-				// Reset so we fall through to allocate the new IP
-				lb.ipAddr = ""
-				lb.ipAddrID = ""
+			found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+			if lookupErr != nil {
+				klog.Warningf("Error looking up annotated IP %v for recovery: %v", annotatedIP, lookupErr)
+			} else if found {
+				klog.V(4).Infof("Recovered previously allocated IP %v from annotation", annotatedIP)
 			}
 		}
 
@@ -190,61 +166,11 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
 	} else if desiredIP != "" && desiredIP != lb.ipAddr {
-		// Desired IP was specified and it's different from the current IP.
-		// Validate the target IP exists before tearing down the old config to avoid
-		// leaving the service in a broken state if the new IP is invalid.
-		if err := lb.validatePublicIPAvailable(desiredIP); err != nil {
-			return nil, fmt.Errorf("cannot switch load balancer to IP %s: %w", desiredIP, err)
-		}
-
-		// Release the old IP first
-		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, desiredIP)
-
-		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
-		for _, oldRule := range lb.rules {
-			proto := ProtocolFromLoadBalancer(oldRule.Protocol)
-			if proto == LoadBalancerProtocolInvalid {
-				klog.Warningf("Skipping firewall cleanup for rule %s: unrecognized protocol %q", oldRule.Name, oldRule.Protocol)
-			}
-			port64, pErr := strconv.ParseInt(oldRule.Publicport, 10, 32)
-			if pErr != nil {
-				klog.Warningf("Skipping firewall cleanup for rule %s: cannot parse port %q: %v", oldRule.Name, oldRule.Publicport, pErr)
-			}
-			if proto != LoadBalancerProtocolInvalid && pErr == nil {
-				if _, fwErr := lb.deleteFirewallRule(oldRule.Publicipid, int(port64), proto); fwErr != nil {
-					klog.V(4).Infof("Ignoring firewall rule delete error for %s: %v", oldRule.Name, fwErr)
-				}
-			}
-
-			if delErr := lb.deleteLoadBalancerRule(oldRule); delErr != nil {
-				// CloudStack sometimes reports deletes as "invalid value" when the entity is already gone.
-				if strings.Contains(delErr.Error(), "does not exist") || strings.Contains(delErr.Error(), "Invalid parameter id value") {
-					klog.V(4).Infof("Load balancer rule %s already removed, continuing: %v", oldRule.Name, delErr)
-
-					continue
-				}
-
-				return nil, delErr
-			}
-		}
-
-		// Prevent any further cleanup from trying to delete stale IDs.
-		lb.rules = make(map[string]*cloudstack.LoadBalancerRule)
-
-		if err := lb.releaseLoadBalancerIP(); err != nil {
-			klog.Errorf("attempt to release old load balancer IP failed: %s", err.Error())
-
-			return nil, fmt.Errorf("failed to release old load balancer IP: %w", err)
-		}
-
-		if err := lb.getLoadBalancerIP(desiredIP); err != nil {
-			klog.Errorf("failed to allocate specified IP %v: %v", desiredIP, err)
-
-			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
-		}
-
-		msg := fmt.Sprintf("Switched load balancer for service %s to specified IP address %s", serviceName, lb.ipAddr)
-		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "UpdatedLoadBalancer", msg)
+		// IP reassignment on an active load balancer is not supported.
+		// Users must delete and recreate the service to change the IP.
+		msg := fmt.Sprintf("Load balancer IP change from %s to %s is not supported; delete and recreate the service to use a different IP", lb.ipAddr, desiredIP)
+		cs.eventRecorder.Event(service, corev1.EventTypeWarning, "IPChangeNotSupported", msg)
+		klog.Warning(msg)
 	}
 
 	klog.V(4).Infof("Load balancer %v is associated with IP %v", lb.name, lb.ipAddr)
@@ -788,31 +714,6 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 	}
 
 	return lb.associatePublicIPAddress()
-}
-
-// validatePublicIPAvailable checks that the given IP address exists in CloudStack
-// without modifying any load balancer state. Used as a pre-flight check before
-// tearing down an existing configuration.
-func (lb *loadBalancer) validatePublicIPAvailable(ip string) error {
-	p := lb.Address.NewListPublicIpAddressesParams()
-	p.SetIpaddress(ip)
-	p.SetAllocatedonly(false)
-	p.SetListall(true)
-
-	if lb.projectID != "" {
-		p.SetProjectid(lb.projectID)
-	}
-
-	l, err := lb.Address.ListPublicIpAddresses(p)
-	if err != nil {
-		return fmt.Errorf("error looking up IP address %v: %w", ip, err)
-	}
-
-	if l.Count != 1 {
-		return fmt.Errorf("IP address %v not found (got %d results)", ip, l.Count)
-	}
-
-	return nil
 }
 
 // lookupPublicIPAddress checks whether the given IP address is already allocated in CloudStack.
