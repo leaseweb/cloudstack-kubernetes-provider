@@ -49,8 +49,14 @@ const (
 	// cluster. This is a workaround for https://github.com/kubernetes/kubernetes/issues/66607
 	ServiceAnnotationLoadBalancerLoadbalancerHostname = "service.beta.kubernetes.io/cloudstack-load-balancer-hostname"
 
-	// ServiceAnnotationLoadBalancerAddress is a read-only annotation indicating the IP address assigned to the load balancer.
+	// ServiceAnnotationLoadBalancerAddress is the annotation for the IP address assigned to the load balancer.
+	// Users can set this annotation to request a specific IP address, replacing the deprecated spec.LoadBalancerIP field.
+	// This annotation takes precedence; spec.LoadBalancerIP is only used as a fallback.
 	ServiceAnnotationLoadBalancerAddress = "service.beta.kubernetes.io/cloudstack-load-balancer-address"
+
+	// ServiceAnnotationLoadBalancerKeepIP is a boolean annotation that, when set to "true",
+	// prevents the public IP from being released when the service is deleted.
+	ServiceAnnotationLoadBalancerKeepIP = "service.beta.kubernetes.io/cloudstack-load-balancer-keep-ip"
 
 	// Used to construct the load balancer name.
 	servicePrefix = "K8s_svc_"
@@ -132,14 +138,16 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		return nil, err
 	}
 
+	// Resolve the desired IP: annotation takes precedence, spec.LoadBalancerIP is fallback.
+	desiredIP := getLoadBalancerAddress(service)
+
 	if !lb.hasLoadBalancerIP() { //nolint:nestif
 		// Before allocating a new IP, check the service annotation for a previously assigned IP.
 		// This handles recovery from partial failures where the IP was allocated and annotated
 		// but subsequent operations (rule creation, IP switch) failed.
 		annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
 		if annotatedIP != "" {
-			specIP := service.Spec.LoadBalancerIP
-			if specIP == "" || specIP == annotatedIP {
+			if desiredIP == "" || desiredIP == annotatedIP {
 				// Case 1: Auto-allocated IP recovery — the annotated IP is the one we want.
 				found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
 				if lookupErr != nil {
@@ -149,7 +157,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 				}
 			} else {
 				// Case 2: IP switch retry — annotation holds old IP that failed to release.
-				klog.V(4).Infof("Detected IP switch retry: annotation has %v, spec wants %v; attempting cleanup of old IP", annotatedIP, specIP)
+				klog.V(4).Infof("Detected IP switch retry: annotation has %v, desired is %v; attempting cleanup of old IP", annotatedIP, desiredIP)
 				oldFound, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
 				if lookupErr != nil {
 					klog.Warningf("Error looking up old annotated IP %v during IP switch cleanup: %v", annotatedIP, lookupErr)
@@ -173,7 +181,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 		if !lb.hasLoadBalancerIP() {
 			// Create or retrieve the load balancer IP.
-			if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
+			if err := lb.getLoadBalancerIP(desiredIP); err != nil {
 				return nil, err
 			}
 		}
@@ -181,16 +189,16 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
-	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
-		// LoadBalancerIP was specified and it's different from the current IP.
+	} else if desiredIP != "" && desiredIP != lb.ipAddr {
+		// Desired IP was specified and it's different from the current IP.
 		// Validate the target IP exists before tearing down the old config to avoid
 		// leaving the service in a broken state if the new IP is invalid.
-		if err := lb.validatePublicIPAvailable(service.Spec.LoadBalancerIP); err != nil {
-			return nil, fmt.Errorf("cannot switch load balancer to IP %s: %w", service.Spec.LoadBalancerIP, err)
+		if err := lb.validatePublicIPAvailable(desiredIP); err != nil {
+			return nil, fmt.Errorf("cannot switch load balancer to IP %s: %w", desiredIP, err)
 		}
 
 		// Release the old IP first
-		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, service.Spec.LoadBalancerIP)
+		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, desiredIP)
 
 		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
 		for _, oldRule := range lb.rules {
@@ -229,8 +237,8 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, fmt.Errorf("failed to release old load balancer IP: %w", err)
 		}
 
-		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			klog.Errorf("failed to allocate specified IP %v: %v", service.Spec.LoadBalancerIP, err)
+		if err := lb.getLoadBalancerIP(desiredIP); err != nil {
+			klog.Errorf("failed to allocate specified IP %v: %v", desiredIP, err)
 
 			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
 		}
@@ -492,10 +500,10 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 
 // shouldReleaseLoadBalancerIP determines whether the public IP should be released.
 func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (bool, error) {
-	// If the IP was explicitly specified in the service spec, don't release it
-	// The user is responsible for managing the lifecycle of user-provided IPs
-	if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP == lb.ipAddr {
-		klog.V(4).Infof("IP %v was explicitly specified in service spec, not releasing", lb.ipAddr)
+	// If the keep-ip annotation is set to true, don't release the IP.
+	// The user is responsible for managing the lifecycle of kept IPs.
+	if getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerKeepIP, false) {
+		klog.V(4).Infof("IP %v has keep-ip annotation set, not releasing", lb.ipAddr)
 
 		return false, nil
 	}
@@ -553,7 +561,7 @@ func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.S
 	}
 
 	if !shouldRelease {
-		klog.V(4).Infof("Annotated IP %v should not be released (user-specified or has other rules)", annotatedIP)
+		klog.V(4).Infof("Annotated IP %v should not be released (keep-ip set or has other rules)", annotatedIP)
 
 		return nil
 	}
@@ -1403,6 +1411,20 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	klog.V(4).InfoS("Could not find a Service Annotation; falling back to default setting", "service", klog.KObj(service), "annotationKey", annotationKey, "defaultSetting", defaultSetting)
 
 	return defaultSetting
+}
+
+// getLoadBalancerAddress returns the desired load balancer IP address.
+// It checks the ServiceAnnotationLoadBalancerAddress annotation first (preferred),
+// then falls back to the deprecated spec.LoadBalancerIP field.
+func getLoadBalancerAddress(service *corev1.Service) string {
+	if service == nil {
+		return ""
+	}
+	if addr := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, ""); addr != "" {
+		return addr
+	}
+
+	return service.Spec.LoadBalancerIP //nolint:staticcheck // deprecated but kept as fallback
 }
 
 // setServiceAnnotation is used to create/set or update an annotation on the Service object.
