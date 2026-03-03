@@ -3945,3 +3945,389 @@ func TestShouldReleaseLoadBalancerIPKeepIP(t *testing.T) {
 		}
 	})
 }
+
+func TestGetLoadBalancerID(t *testing.T) {
+	t.Run("annotation present", func(t *testing.T) {
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerID: "ip-uuid-123",
+				},
+			},
+		}
+		if got := getLoadBalancerID(service); got != "ip-uuid-123" {
+			t.Errorf("getLoadBalancerID() = %q, want %q", got, "ip-uuid-123")
+		}
+	})
+
+	t.Run("annotation absent", func(t *testing.T) {
+		service := &corev1.Service{}
+		if got := getLoadBalancerID(service); got != "" {
+			t.Errorf("getLoadBalancerID() = %q, want empty string", got)
+		}
+	})
+}
+
+func TestGetLoadBalancerNetworkID(t *testing.T) {
+	t.Run("annotation present", func(t *testing.T) {
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerNetworkID: "net-uuid-456",
+				},
+			},
+		}
+		if got := getLoadBalancerNetworkID(service); got != "net-uuid-456" {
+			t.Errorf("getLoadBalancerNetworkID() = %q, want %q", got, "net-uuid-456")
+		}
+	})
+
+	t.Run("annotation absent", func(t *testing.T) {
+		service := &corev1.Service{}
+		if got := getLoadBalancerNetworkID(service); got != "" {
+			t.Errorf("getLoadBalancerNetworkID() = %q, want empty string", got)
+		}
+	})
+}
+
+func TestGetLoadBalancerByID(t *testing.T) {
+	t.Run("rules found by IP ID", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		listResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 2,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Name: "lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "lb-tcp-443", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+			},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		lb, err := cs.getLoadBalancerByID("my-lb", "ip-1", "net-1")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(lb.rules))
+		}
+		if lb.ipAddr != "1.2.3.4" {
+			t.Errorf("ipAddr = %q, want %q", lb.ipAddr, "1.2.3.4")
+		}
+		if lb.ipAddrID != "ip-1" {
+			t.Errorf("ipAddrID = %q, want %q", lb.ipAddrID, "ip-1")
+		}
+		if lb.networkID != "net-1" {
+			t.Errorf("networkID = %q, want %q", lb.networkID, "net-1")
+		}
+	})
+
+	t.Run("no rules found", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		listResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count:             0,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		lb, err := cs.getLoadBalancerByID("my-lb", "ip-1", "net-1")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 0 {
+			t.Fatalf("expected 0 rules, got %d", len(lb.rules))
+		}
+	})
+
+	t.Run("API error propagated", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nil, errors.New("API failure"))
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		_, err := cs.getLoadBalancerByID("my-lb", "ip-1", "net-1")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "API failure") {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), "API failure")
+		}
+	})
+
+	t.Run("with project ID", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		listResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count:             0,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).DoAndReturn(func(p *cloudstack.ListLoadBalancerRulesParams) (*cloudstack.ListLoadBalancerRulesResponse, error) {
+			projectID, ok := p.GetProjectid()
+			if !ok || projectID != "proj-1" {
+				t.Errorf("expected projectid = %q, got %q (ok=%v)", "proj-1", projectID, ok)
+			}
+
+			return listResp, nil
+		})
+
+		cs := &CSCloud{
+			projectID: "proj-1",
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		_, err := cs.getLoadBalancerByID("my-lb", "ip-1", "net-1")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty network ID omits SetNetworkid", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		listResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count:             0,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).DoAndReturn(func(p *cloudstack.ListLoadBalancerRulesParams) (*cloudstack.ListLoadBalancerRulesResponse, error) {
+			_, ok := p.GetNetworkid()
+			if ok {
+				t.Error("expected networkid to not be set when empty string passed")
+			}
+
+			return listResp, nil
+		})
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		_, err := cs.getLoadBalancerByID("my-lb", "ip-1", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestGetLoadBalancerOrchestrator(t *testing.T) {
+	t.Run("ID annotation present and rules found - returns ID-based result", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		// ID-based lookup returns rules
+		idResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Name: "lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+			},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(idResp, nil)
+		// Name-based lookup should NOT be called
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerID:        "ip-1",
+					ServiceAnnotationLoadBalancerNetworkID: "net-1",
+				},
+			},
+		}
+
+		lb, err := cs.getLoadBalancer(service, "my-lb", "legacy-lb")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(lb.rules))
+		}
+		if lb.ipAddr != "1.2.3.4" {
+			t.Errorf("ipAddr = %q, want %q", lb.ipAddr, "1.2.3.4")
+		}
+	})
+
+	t.Run("ID annotation present but no rules - falls back to name-based", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+
+		// First call: ID-based lookup → no rules
+		idParams := &cloudstack.ListLoadBalancerRulesParams{}
+		idResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count:             0,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}
+
+		// Second call: name-based lookup → rules found
+		nameParams := &cloudstack.ListLoadBalancerRulesParams{}
+		nameResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Name: "my-lb-tcp-80", Publicip: "5.6.7.8", Publicipid: "ip-2"},
+			},
+		}
+
+		gomock.InOrder(
+			mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(idParams),
+			mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(idResp, nil),
+			mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(nameParams),
+			mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nameResp, nil),
+		)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerID:        "ip-stale",
+					ServiceAnnotationLoadBalancerNetworkID: "net-stale",
+				},
+			},
+		}
+
+		lb, err := cs.getLoadBalancer(service, "my-lb", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(lb.rules))
+		}
+		if lb.ipAddr != "5.6.7.8" {
+			t.Errorf("ipAddr = %q, want %q", lb.ipAddr, "5.6.7.8")
+		}
+	})
+
+	t.Run("no ID annotation - goes directly to name-based", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		nameResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Name: "my-lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1"},
+			},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nameResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		service := &corev1.Service{} // no annotations
+
+		lb, err := cs.getLoadBalancer(service, "my-lb", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(lb.rules))
+		}
+		if lb.ipAddr != "1.2.3.4" {
+			t.Errorf("ipAddr = %q, want %q", lb.ipAddr, "1.2.3.4")
+		}
+	})
+
+	t.Run("ID-based API error propagated without fallback", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nil, errors.New("infra error"))
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerID: "ip-1",
+				},
+			},
+		}
+
+		_, err := cs.getLoadBalancer(service, "my-lb", "")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "infra error") {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), "infra error")
+		}
+	})
+}
