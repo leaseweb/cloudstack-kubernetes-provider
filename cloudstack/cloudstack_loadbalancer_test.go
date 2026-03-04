@@ -3305,14 +3305,6 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 		mockAddress.EXPECT().NewDisassociateIpAddressParams("ip-orphan").Return(&cloudstack.DisassociateIpAddressParams{})
 		mockAddress.EXPECT().DisassociateIpAddress(gomock.Any()).Return(&cloudstack.DisassociateIpAddressResponse{}, nil)
 
-		cs := &CSCloud{
-			client: &cloudstack.CloudStackClient{
-				LoadBalancer: mockLB,
-				Address:      mockAddress,
-			},
-			eventRecorder: record.NewFakeRecorder(10),
-		}
-
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo",
@@ -3321,6 +3313,15 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 					ServiceAnnotationLoadBalancerAddress: "10.0.0.1",
 				},
 			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
 		}
 
 		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
@@ -3336,17 +3337,19 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
 		setupGetLoadBalancerByNameEmpty(mockLB)
 
-		cs := &CSCloud{
-			client: &cloudstack.CloudStackClient{
-				LoadBalancer: mockLB,
-			},
-		}
-
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo",
 				Namespace: "default",
 			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
 		}
 
 		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
@@ -3370,13 +3373,6 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 			Count: 0, PublicIpAddresses: []*cloudstack.PublicIpAddress{},
 		}, nil)
 
-		cs := &CSCloud{
-			client: &cloudstack.CloudStackClient{
-				LoadBalancer: mockLB,
-				Address:      mockAddress,
-			},
-		}
-
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo",
@@ -3385,6 +3381,15 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 					ServiceAnnotationLoadBalancerAddress: "10.0.0.1",
 				},
 			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
 		}
 
 		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
@@ -3421,13 +3426,6 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 		mockAddress.EXPECT().NewDisassociateIpAddressParams("ip-orphan").Return(&cloudstack.DisassociateIpAddressParams{})
 		mockAddress.EXPECT().DisassociateIpAddress(gomock.Any()).Return(nil, errors.New("release failed"))
 
-		cs := &CSCloud{
-			client: &cloudstack.CloudStackClient{
-				LoadBalancer: mockLB,
-				Address:      mockAddress,
-			},
-		}
-
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo",
@@ -3436,6 +3434,15 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 					ServiceAnnotationLoadBalancerAddress: "10.0.0.1",
 				},
 			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
 		}
 
 		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
@@ -3466,13 +3473,6 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 		}, nil)
 		// shouldReleaseLoadBalancerIP returns false because keep-ip annotation is set
 
-		cs := &CSCloud{
-			client: &cloudstack.CloudStackClient{
-				LoadBalancer: mockLB,
-				Address:      mockAddress,
-			},
-		}
-
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo",
@@ -3484,9 +3484,180 @@ func TestEnsureLoadBalancerDeletedOrphanedIP(t *testing.T) {
 			},
 		}
 
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
+		}
+
 		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestEnsureLoadBalancerDeletedAnnotationCleanup(t *testing.T) {
+	// allLBAnnotations returns a map with all 6 CloudStack LB annotations set.
+	allLBAnnotations := func() map[string]string {
+		return map[string]string{
+			ServiceAnnotationLoadBalancerProxyProtocol:        "true",
+			ServiceAnnotationLoadBalancerLoadbalancerHostname: "lb.example.com",
+			ServiceAnnotationLoadBalancerAddress:              "10.0.0.1",
+			ServiceAnnotationLoadBalancerKeepIP:               "false",
+			ServiceAnnotationLoadBalancerID:                   "ip-1",
+			ServiceAnnotationLoadBalancerNetworkID:            "net-1",
+		}
+	}
+
+	lbAnnotationKeys := []string{
+		ServiceAnnotationLoadBalancerProxyProtocol,
+		ServiceAnnotationLoadBalancerLoadbalancerHostname,
+		ServiceAnnotationLoadBalancerAddress,
+		ServiceAnnotationLoadBalancerKeepIP,
+		ServiceAnnotationLoadBalancerID,
+		ServiceAnnotationLoadBalancerNetworkID,
+	}
+
+	t.Run("annotations removed after successful deletion", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockAddress := cloudstack.NewMockAddressServiceIface(ctrl)
+		mockFirewall := cloudstack.NewMockFirewallServiceIface(ctrl)
+
+		// getLoadBalancerByName returns one rule
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{
+					Id: "rule-1", Name: "K8s_svc_cluster_default_foo-tcp-80",
+					Publicip: "10.0.0.1", Publicipid: "ip-1", Publicport: "80",
+					Protocol: "tcp", Networkid: "net-1",
+				},
+			},
+		}, nil)
+
+		// deleteFirewallRule
+		mockFirewall.EXPECT().NewListFirewallRulesParams().Return(&cloudstack.ListFirewallRulesParams{})
+		mockFirewall.EXPECT().ListFirewallRules(gomock.Any()).Return(&cloudstack.ListFirewallRulesResponse{
+			Count: 0, FirewallRules: []*cloudstack.FirewallRule{},
+		}, nil)
+
+		// deleteLoadBalancerRule
+		mockLB.EXPECT().NewDeleteLoadBalancerRuleParams("rule-1").Return(&cloudstack.DeleteLoadBalancerRuleParams{})
+		mockLB.EXPECT().DeleteLoadBalancerRule(gomock.Any()).Return(&cloudstack.DeleteLoadBalancerRuleResponse{}, nil)
+
+		// shouldReleaseLoadBalancerIP: no keep-ip, no other rules
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 0, LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}, nil)
+
+		// releaseLoadBalancerIP
+		mockAddress.EXPECT().NewDisassociateIpAddressParams("ip-1").Return(&cloudstack.DisassociateIpAddressParams{})
+		mockAddress.EXPECT().DisassociateIpAddress(gomock.Any()).Return(&cloudstack.DisassociateIpAddressResponse{}, nil)
+
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "foo",
+				Namespace:   "default",
+				Annotations: allLBAnnotations(),
+			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+				Firewall:     mockFirewall,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
+		}
+
+		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		for _, key := range lbAnnotationKeys {
+			if _, ok := service.Annotations[key]; ok {
+				t.Errorf("annotation %q should have been removed", key)
+			}
+		}
+	})
+
+	t.Run("annotations preserved when deletion fails", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockAddress := cloudstack.NewMockAddressServiceIface(ctrl)
+		mockFirewall := cloudstack.NewMockFirewallServiceIface(ctrl)
+
+		// getLoadBalancerByName returns one rule
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{}).Times(2)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{
+					Id: "rule-1", Name: "K8s_svc_cluster_default_foo-tcp-80",
+					Publicip: "10.0.0.1", Publicipid: "ip-1", Publicport: "80",
+					Protocol: "tcp", Networkid: "net-1",
+				},
+			},
+		}, nil).Times(1)
+
+		// deleteFirewallRule fails
+		mockFirewall.EXPECT().NewListFirewallRulesParams().Return(&cloudstack.ListFirewallRulesParams{})
+		mockFirewall.EXPECT().ListFirewallRules(gomock.Any()).Return(nil, errors.New("firewall error"))
+
+		// deleteLoadBalancerRule fails
+		mockLB.EXPECT().NewDeleteLoadBalancerRuleParams("rule-1").Return(&cloudstack.DeleteLoadBalancerRuleParams{})
+		mockLB.EXPECT().DeleteLoadBalancerRule(gomock.Any()).Return(nil, errors.New("delete rule error"))
+
+		// shouldReleaseLoadBalancerIP is still called (IP cleanup attempted even on rule errors)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 0, LoadBalancerRules: []*cloudstack.LoadBalancerRule{},
+		}, nil)
+
+		// releaseLoadBalancerIP also fails
+		mockAddress.EXPECT().NewDisassociateIpAddressParams("ip-1").Return(&cloudstack.DisassociateIpAddressParams{})
+		mockAddress.EXPECT().DisassociateIpAddress(gomock.Any()).Return(nil, errors.New("release failed"))
+
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "foo",
+				Namespace:   "default",
+				Annotations: allLBAnnotations(),
+			},
+		}
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+				Address:      mockAddress,
+				Firewall:     mockFirewall,
+			},
+			kclient:       fake.NewSimpleClientset(service),
+			eventRecorder: record.NewFakeRecorder(10),
+		}
+
+		err := cs.EnsureLoadBalancerDeleted(t.Context(), "cluster", service)
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+
+		for _, key := range lbAnnotationKeys {
+			if _, ok := service.Annotations[key]; !ok {
+				t.Errorf("annotation %q should have been preserved on error", key)
+			}
 		}
 	})
 }

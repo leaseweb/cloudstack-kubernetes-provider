@@ -324,8 +324,12 @@ func isFirewallSupported(services []cloudstack.NetworkServiceInternal) bool {
 
 // EnsureLoadBalancerDeleted deletes the specified load balancer if it exists, returning
 // nil if the load balancer specified either didn't exist or was successfully deleted.
-func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *corev1.Service) error {
+func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *corev1.Service) (err error) {
 	klog.V(4).InfoS("EnsureLoadBalancerDeleted", "cluster", clusterName, "service", klog.KObj(service))
+
+	// Patch the service to remove annotations after EnsureLoadBalancerDeleted finishes.
+	patcher := newServicePatcher(cs.kclient, service)
+	defer func() { err = patcher.Patch(ctx, err) }()
 
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
@@ -340,7 +344,17 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 	if len(lb.rules) == 0 {
 		klog.V(4).Infof("No load balancer rules found for service, checking annotation for orphaned IP")
 
-		return cs.releaseOrphanedIPIfNeeded(lb, service)
+		if err := cs.releaseOrphanedIPIfNeeded(lb, service); err != nil {
+			return err
+		}
+
+		// If the service is not marked for deletion (f.e. when switching from type
+		// LoadBalancer to ClusterIP), remove our annotations.
+		if service.DeletionTimestamp.IsZero() {
+			deleteLoadBalancerAnnotations(service)
+		}
+
+		return nil
 	}
 
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
@@ -425,6 +439,12 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 
 		// Return the first error or a combined error message
 		return fmt.Errorf("load balancer deletion completed with errors: %w", deletionErrors[0])
+	}
+
+	// If the service is not marked for deletion (f.e. when switching from type
+	// LoadBalancer to ClusterIP), remove our annotations.
+	if service.DeletionTimestamp.IsZero() {
+		deleteLoadBalancerAnnotations(service)
 	}
 
 	msg := "Successfully deleted load balancer for service " + serviceName
@@ -1420,4 +1440,22 @@ func setServiceAnnotation(service *corev1.Service, key, value string) {
 		service.ObjectMeta.Annotations = map[string]string{}
 	}
 	service.ObjectMeta.Annotations[key] = value
+}
+
+// deleteServiceAnnotation removes an annotation from the Service object.
+func deleteServiceAnnotation(service *corev1.Service, key string) {
+	if service.ObjectMeta.Annotations == nil {
+		return
+	}
+	delete(service.ObjectMeta.Annotations, key)
+}
+
+// deleteLoadBalancerAnnotations removes all CloudStack load balancer annotations from the service.
+func deleteLoadBalancerAnnotations(service *corev1.Service) {
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyProtocol)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerLoadbalancerHostname)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerKeepIP)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerID)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID)
 }
