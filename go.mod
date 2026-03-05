@@ -5,14 +5,14 @@ go 1.24.0
 require (
 	github.com/apache/cloudstack-go/v2 v2.17.1
 	github.com/google/go-cmp v0.7.0
-	github.com/stretchr/testify v1.10.0
-	go.uber.org/mock v0.5.2
+	github.com/stretchr/testify v1.11.1
+	go.uber.org/mock v0.6.0
 	gopkg.in/gcfg.v1 v1.2.3
-	k8s.io/api v0.33.3
-	k8s.io/apimachinery v0.33.3
-	k8s.io/client-go v0.33.3
-	k8s.io/cloud-provider v0.33.3
-	k8s.io/component-base v0.33.3
+	k8s.io/api v0.33.9
+	k8s.io/apimachinery v0.33.9
+	k8s.io/client-go v0.33.9
+	k8s.io/cloud-provider v0.33.9
+	k8s.io/component-base v0.33.9
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738
 )
@@ -84,7 +84,7 @@ require (
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect
-	golang.org/x/sync v0.12.0 // indirect
+	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/term v0.30.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
@@ -98,10 +98,10 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/warnings.v0 v0.1.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apiserver v0.33.3 // indirect
-	k8s.io/component-helpers v0.33.3 // indirect
-	k8s.io/controller-manager v0.33.3 // indirect
-	k8s.io/kms v0.33.3 // indirect
+	k8s.io/apiserver v0.33.9 // indirect
+	k8s.io/component-helpers v0.33.9 // indirect
+	k8s.io/controller-manager v0.33.9 // indirect
+	k8s.io/kms v0.33.9 // indirect
 	k8s.io/kube-openapi v0.0.0-20250318190949-c8a335a9a2ff // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
@@ -111,8 +111,8 @@ require (
 )
 
 replace (
-	k8s.io/apiserver => k8s.io/apiserver v0.33.3
-	k8s.io/component-helpers => k8s.io/component-helpers v0.33.3
-	k8s.io/controller-manager => k8s.io/controller-manager v0.33.3
-	k8s.io/kms => k8s.io/kms v0.33.3
+	k8s.io/apiserver => k8s.io/apiserver v0.33.9
+	k8s.io/component-helpers => k8s.io/component-helpers v0.33.9
+	k8s.io/controller-manager => k8s.io/controller-manager v0.33.9
+	k8s.io/kms => k8s.io/kms v0.33.9
 )
