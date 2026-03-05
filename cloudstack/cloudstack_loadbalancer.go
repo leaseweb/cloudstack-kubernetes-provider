@@ -49,8 +49,22 @@ const (
 	// cluster. This is a workaround for https://github.com/kubernetes/kubernetes/issues/66607
 	ServiceAnnotationLoadBalancerLoadbalancerHostname = "service.beta.kubernetes.io/cloudstack-load-balancer-hostname"
 
-	// ServiceAnnotationLoadBalancerAddress is a read-only annotation indicating the IP address assigned to the load balancer.
+	// ServiceAnnotationLoadBalancerAddress is the annotation for the IP address assigned to the load balancer.
+	// Users can set this annotation to request a specific IP address, replacing the deprecated spec.LoadBalancerIP field.
+	// This annotation takes precedence; spec.LoadBalancerIP is only used as a fallback.
 	ServiceAnnotationLoadBalancerAddress = "service.beta.kubernetes.io/cloudstack-load-balancer-address"
+
+	// ServiceAnnotationLoadBalancerKeepIP is a boolean annotation that, when set to "true",
+	// prevents the public IP from being released when the service is deleted.
+	ServiceAnnotationLoadBalancerKeepIP = "service.beta.kubernetes.io/cloudstack-load-balancer-keep-ip"
+
+	// ServiceAnnotationLoadBalancerID stores the CloudStack public IP UUID associated with the load balancer.
+	// Used for efficient ID-based lookups instead of keyword-based searches.
+	ServiceAnnotationLoadBalancerID = "service.beta.kubernetes.io/cloudstack-load-balancer-id"
+
+	// ServiceAnnotationLoadBalancerNetworkID stores the CloudStack network UUID associated with the load balancer.
+	// Used together with ServiceAnnotationLoadBalancerID for scoped ID-based lookups.
+	ServiceAnnotationLoadBalancerNetworkID = "service.beta.kubernetes.io/cloudstack-load-balancer-network-id"
 
 	// Used to construct the load balancer name.
 	servicePrefix = "K8s_svc_"
@@ -77,7 +91,7 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
 	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
-	lb, err := cs.getLoadBalancerByName(name, legacyName)
+	lb, err := cs.getLoadBalancer(service, name, legacyName)
 	if err != nil {
 		return nil, false, err
 	}
@@ -111,7 +125,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
 	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
-	lb, err := cs.getLoadBalancerByName(name, legacyName)
+	lb, err := cs.getLoadBalancer(service, name, legacyName)
 	if err != nil {
 		return nil, err
 	}
@@ -132,65 +146,47 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		return nil, err
 	}
 
+	// Resolve the desired IP: annotation takes precedence, spec.LoadBalancerIP is fallback.
+	desiredIP := getLoadBalancerAddress(service)
+
 	if !lb.hasLoadBalancerIP() { //nolint:nestif
-		// Create or retrieve the load balancer IP.
-		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			return nil, err
+		// Before allocating a new IP, check the service annotation for a previously assigned IP.
+		// This handles recovery from partial failures where the IP was allocated and annotated
+		// but subsequent operations (rule creation) failed.
+		annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
+		if annotatedIP != "" {
+			found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+			if lookupErr != nil {
+				klog.Warningf("Error looking up annotated IP %v for recovery: %v", annotatedIP, lookupErr)
+			} else if found {
+				klog.V(4).Infof("Recovered previously allocated IP %v from annotation", annotatedIP)
+			}
+		}
+
+		if !lb.hasLoadBalancerIP() {
+			// Create or retrieve the load balancer IP.
+			if err := lb.getLoadBalancerIP(desiredIP); err != nil {
+				return nil, err
+			}
 		}
 
 		msg := fmt.Sprintf("Created new load balancer for service %s with algorithm '%s' and IP address %s", serviceName, lb.algorithm, lb.ipAddr)
 		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "CreatedLoadBalancer", msg)
 		klog.Info(msg)
-	} else if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP != lb.ipAddr {
-		// LoadBalancerIP was specified and it's different from the current IP
-		// Release the old IP first
-		klog.V(4).Infof("Deleting firewall rules for old ip and releasing old load balancer IP %v, switching to specified IP %v", lb.ipAddr, service.Spec.LoadBalancerIP)
-
-		// Best-effort cleanup of existing rules bound to the current IP to avoid stale deletes / name conflicts.
-		for _, oldRule := range lb.rules {
-			proto := ProtocolFromLoadBalancer(oldRule.Protocol)
-			port64, pErr := strconv.ParseInt(oldRule.Publicport, 10, 32)
-			if proto != LoadBalancerProtocolInvalid && pErr == nil {
-				if _, fwErr := lb.deleteFirewallRule(oldRule.Publicipid, int(port64), proto); fwErr != nil {
-					klog.V(4).Infof("Ignoring firewall rule delete error for %s: %v", oldRule.Name, fwErr)
-				}
-			}
-
-			if delErr := lb.deleteLoadBalancerRule(oldRule); delErr != nil {
-				// CloudStack sometimes reports deletes as "invalid value" when the entity is already gone.
-				if strings.Contains(delErr.Error(), "does not exist") || strings.Contains(delErr.Error(), "Invalid parameter id value") {
-					klog.V(4).Infof("Load balancer rule %s already removed, continuing: %v", oldRule.Name, delErr)
-
-					continue
-				}
-
-				return nil, delErr
-			}
-		}
-
-		// Prevent any further cleanup from trying to delete stale IDs.
-		lb.rules = make(map[string]*cloudstack.LoadBalancerRule)
-
-		if err := lb.releaseLoadBalancerIP(); err != nil {
-			klog.Errorf("attempt to release old load balancer IP failed: %s", err.Error())
-
-			return nil, fmt.Errorf("failed to release old load balancer IP: %w", err)
-		}
-
-		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			klog.Errorf("failed to allocate specified IP %v: %v", service.Spec.LoadBalancerIP, err)
-
-			return nil, fmt.Errorf("failed to allocate specified load balancer IP: %w", err)
-		}
-
-		msg := fmt.Sprintf("Switched load balancer for service %s to specified IP address %s", serviceName, lb.ipAddr)
-		cs.eventRecorder.Event(service, corev1.EventTypeNormal, "UpdatedLoadBalancer", msg)
+	} else if desiredIP != "" && desiredIP != lb.ipAddr {
+		// IP reassignment on an active load balancer is not supported.
+		// Users must delete and recreate the service to change the IP.
+		msg := fmt.Sprintf("Load balancer IP change from %s to %s is not supported; delete and recreate the service to use a different IP", lb.ipAddr, desiredIP)
+		cs.eventRecorder.Event(service, corev1.EventTypeWarning, "IPChangeNotSupported", msg)
+		klog.Warning(msg)
 	}
 
 	klog.V(4).Infof("Load balancer %v is associated with IP %v", lb.name, lb.ipAddr)
 
-	// Set the load balancer IP address annotation on the Service
+	// Set the load balancer annotations on the Service
 	setServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, lb.ipAddr)
+	setServiceAnnotation(service, ServiceAnnotationLoadBalancerID, lb.ipAddrID)
+	setServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID, lb.networkID)
 
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
@@ -240,10 +236,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
 		if err != nil {
 			if count == 0 {
-				return nil, err
+				return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
 			}
 
-			return nil, err
+			return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
 		}
 
 		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
@@ -295,7 +291,7 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
 	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
-	lb, err := cs.getLoadBalancerByName(name, legacyName)
+	lb, err := cs.getLoadBalancer(service, name, legacyName)
 	if err != nil {
 		return err
 	}
@@ -328,20 +324,35 @@ func isFirewallSupported(services []cloudstack.NetworkServiceInternal) bool {
 
 // EnsureLoadBalancerDeleted deletes the specified load balancer if it exists, returning
 // nil if the load balancer specified either didn't exist or was successfully deleted.
-func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *corev1.Service) error {
+func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *corev1.Service) (err error) {
 	klog.V(4).InfoS("EnsureLoadBalancerDeleted", "cluster", clusterName, "service", klog.KObj(service))
+
+	// Patch the service to remove annotations after EnsureLoadBalancerDeleted finishes.
+	patcher := newServicePatcher(cs.kclient, service)
+	defer func() { err = patcher.Patch(ctx, err) }()
 
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
 	legacyName := cs.getLoadBalancerLegacyName(ctx, clusterName, service)
-	lb, err := cs.getLoadBalancerByName(name, legacyName)
+	lb, err := cs.getLoadBalancer(service, name, legacyName)
 	if err != nil {
 		return err
 	}
 
-	// If no rules exist, the load balancer doesn't exist - nothing to delete
+	// If no rules exist, the load balancer doesn't exist. However, an IP may have been
+	// orphaned from a previous partial failure. Check the service annotation for cleanup.
 	if len(lb.rules) == 0 {
-		klog.V(4).Infof("No load balancer rules found for service, nothing to delete")
+		klog.V(4).Infof("No load balancer rules found for service, checking annotation for orphaned IP")
+
+		if err := cs.releaseOrphanedIPIfNeeded(lb, service); err != nil {
+			return err
+		}
+
+		// If the service is not marked for deletion (f.e. when switching from type
+		// LoadBalancer to ClusterIP), remove our annotations.
+		if service.DeletionTimestamp.IsZero() {
+			deleteLoadBalancerAnnotations(service)
+		}
 
 		return nil
 	}
@@ -430,6 +441,12 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 		return fmt.Errorf("load balancer deletion completed with errors: %w", deletionErrors[0])
 	}
 
+	// If the service is not marked for deletion (f.e. when switching from type
+	// LoadBalancer to ClusterIP), remove our annotations.
+	if service.DeletionTimestamp.IsZero() {
+		deleteLoadBalancerAnnotations(service)
+	}
+
 	msg := "Successfully deleted load balancer for service " + serviceName
 	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "DeletedLoadBalancer", msg)
 	klog.Info(msg)
@@ -439,10 +456,10 @@ func (cs *CSCloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName st
 
 // shouldReleaseLoadBalancerIP determines whether the public IP should be released.
 func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (bool, error) {
-	// If the IP was explicitly specified in the service spec, don't release it
-	// The user is responsible for managing the lifecycle of user-provided IPs
-	if service.Spec.LoadBalancerIP != "" && service.Spec.LoadBalancerIP == lb.ipAddr {
-		klog.V(4).Infof("IP %v was explicitly specified in service spec, not releasing", lb.ipAddr)
+	// If the keep-ip annotation is set to true, don't release the IP.
+	// The user is responsible for managing the lifecycle of kept IPs.
+	if getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerKeepIP, false) {
+		klog.V(4).Infof("IP %v has keep-ip annotation set, not releasing", lb.ipAddr)
 
 		return false, nil
 	}
@@ -473,6 +490,50 @@ func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1
 	return true, nil
 }
 
+// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
+// This handles the case where all LB rules were successfully deleted but IP release failed on a prior attempt.
+func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
+	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
+	if annotatedIP == "" {
+		return nil
+	}
+
+	found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
+	if lookupErr != nil {
+		klog.Warningf("Error looking up annotated IP %v during delete: %v", annotatedIP, lookupErr)
+
+		return nil
+	}
+
+	if !found {
+		return nil
+	}
+
+	shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
+	if shouldErr != nil {
+		klog.Warningf("Error checking if annotated IP %v should be released: %v", annotatedIP, shouldErr)
+
+		return nil
+	}
+
+	if !shouldRelease {
+		klog.V(4).Infof("Annotated IP %v should not be released (keep-ip set or has other rules)", annotatedIP)
+
+		return nil
+	}
+
+	if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
+		return fmt.Errorf("error releasing orphaned load balancer IP %v: %w", annotatedIP, releaseErr)
+	}
+
+	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+	msg := fmt.Sprintf("Released orphaned load balancer IP %s for service %s", annotatedIP, serviceName)
+	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "ReleasedOrphanedIP", msg)
+	klog.Info(msg)
+
+	return nil
+}
+
 // GetLoadBalancerName returns the name of the LoadBalancer.
 func (cs *CSCloud) GetLoadBalancerName(_ context.Context, clusterName string, service *corev1.Service) string {
 	return Sprintf255(lbNameFormat, servicePrefix, clusterName, service.Namespace, service.Name)
@@ -481,6 +542,42 @@ func (cs *CSCloud) GetLoadBalancerName(_ context.Context, clusterName string, se
 // getLoadBalancerLegacyName returns the legacy load balancer name for backward compatibility.
 func (cs *CSCloud) getLoadBalancerLegacyName(_ context.Context, _ string, service *corev1.Service) string {
 	return cloudprovider.DefaultLoadBalancerName(service)
+}
+
+// filterRulesByPrefix returns only the rules whose Name starts with the given prefix.
+// This is needed because CloudStack's SetKeyword uses LIKE %keyword% matching,
+// which can return rules belonging to other services with overlapping name substrings.
+func filterRulesByPrefix(rules []*cloudstack.LoadBalancerRule, prefix string) []*cloudstack.LoadBalancerRule {
+	var filtered []*cloudstack.LoadBalancerRule
+	for _, rule := range rules {
+		if strings.HasPrefix(rule.Name, prefix) {
+			filtered = append(filtered, rule)
+		}
+	}
+
+	return filtered
+}
+
+// getLoadBalancer tries to find the load balancer using ID-based lookup first (if annotations
+// are present), then falls back to the keyword-based name lookup.
+func (cs *CSCloud) getLoadBalancer(service *corev1.Service, name, legacyName string) (*loadBalancer, error) {
+	if ipAddrID := getLoadBalancerID(service); ipAddrID != "" {
+		networkID := getLoadBalancerNetworkID(service)
+		klog.V(4).Infof("Attempting ID-based load balancer lookup: ipAddrID=%v, networkID=%v", ipAddrID, networkID)
+
+		lb, err := cs.getLoadBalancerByID(name, ipAddrID, networkID)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(lb.rules) > 0 {
+			return lb, nil
+		}
+
+		klog.V(4).Infof("ID-based lookup returned no rules, falling back to name-based lookup")
+	}
+
+	return cs.getLoadBalancerByName(name, legacyName)
 }
 
 // getLoadBalancerByName retrieves the IP address and ID and all the existing rules it can find.
@@ -505,23 +602,29 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 		return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
 	}
 
+	// Filter keyword results to exact prefix matches. CloudStack's SetKeyword uses
+	// LIKE %keyword% matching, so searching for "foo" can also return "foobar" rules.
+	filtered := filterRulesByPrefix(l.LoadBalancerRules, lb.name+"-")
+
 	// If no rules were found, check the legacy name.
-	if len(l.LoadBalancerRules) == 0 { //nolint:nestif
+	if len(filtered) == 0 { //nolint:nestif
 		if len(legacyName) > 0 {
 			p.SetKeyword(legacyName)
 			l, err = cs.client.LoadBalancer.ListLoadBalancerRules(p)
 			if err != nil {
 				return nil, fmt.Errorf("error retrieving load balancer rules: %w", err)
 			}
-			if len(l.LoadBalancerRules) > 0 {
+			legacyFiltered := filterRulesByPrefix(l.LoadBalancerRules, legacyName+"-")
+			if len(legacyFiltered) > 0 {
 				lb.name = legacyName
+				filtered = legacyFiltered
 			}
 		} else {
 			return lb, nil
 		}
 	}
 
-	for _, lbRule := range l.LoadBalancerRules {
+	for _, lbRule := range filtered {
 		lb.rules[lbRule.Name] = lbRule
 
 		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
@@ -533,6 +636,50 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 	}
 
 	klog.V(4).Infof("Load balancer %v contains %d rule(s)", lb.name, len(lb.rules))
+
+	return lb, nil
+}
+
+// getLoadBalancerByID retrieves load balancer rules by public IP ID and network ID.
+// This is more reliable than keyword-based search as it uses exact ID matching.
+func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadBalancer, error) {
+	lb := &loadBalancer{
+		CloudStackClient: cs.client,
+		name:             name,
+		projectID:        cs.projectID,
+		rules:            make(map[string]*cloudstack.LoadBalancerRule),
+	}
+
+	p := cs.client.LoadBalancer.NewListLoadBalancerRulesParams()
+	p.SetPublicipid(ipAddrID)
+	p.SetListall(true)
+
+	if networkID != "" {
+		p.SetNetworkid(networkID)
+	}
+
+	if cs.projectID != "" {
+		p.SetProjectid(cs.projectID)
+	}
+
+	l, err := cs.client.LoadBalancer.ListLoadBalancerRules(p)
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving load balancer rules by IP ID %v: %w", ipAddrID, err)
+	}
+
+	for _, lbRule := range l.LoadBalancerRules {
+		lb.rules[lbRule.Name] = lbRule
+
+		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
+			klog.Warningf("Load balancer %v has rules associated with different IP's: %v, %v", lb.name, lb.ipAddr, lbRule.Publicip)
+		}
+
+		lb.ipAddr = lbRule.Publicip
+		lb.ipAddrID = lbRule.Publicipid
+		lb.networkID = lbRule.Networkid
+	}
+
+	klog.V(4).Infof("Load balancer %v (by ID %v) contains %d rule(s)", lb.name, ipAddrID, len(lb.rules))
 
 	return lb, nil
 }
@@ -636,7 +783,7 @@ func (cs *CSCloud) listAllVirtualMachines() ([]*cloudstack.VirtualMachine, error
 
 		l, err := cs.client.VirtualMachine.ListVirtualMachines(p)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list virtual machines: %w", err)
 		}
 
 		allVMs = append(allVMs, l.VirtualMachines...)
@@ -663,6 +810,35 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 	}
 
 	return lb.associatePublicIPAddress()
+}
+
+// lookupPublicIPAddress checks whether the given IP address is already allocated in CloudStack.
+// If found and allocated, it sets lb.ipAddr and lb.ipAddrID and returns (true, nil).
+// If not found or not allocated, it returns (false, nil) without modifying lb state.
+// Unlike getPublicIPAddress, this method does NOT call associatePublicIPAddress for unallocated IPs.
+func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
+	p := lb.Address.NewListPublicIpAddressesParams()
+	p.SetIpaddress(ip)
+	p.SetAllocatedonly(true)
+	p.SetListall(true)
+
+	if lb.projectID != "" {
+		p.SetProjectid(lb.projectID)
+	}
+
+	l, err := lb.Address.ListPublicIpAddresses(p)
+	if err != nil {
+		return false, fmt.Errorf("error looking up IP address %v: %w", ip, err)
+	}
+
+	if l.Count != 1 {
+		return false, nil
+	}
+
+	lb.ipAddr = l.PublicIpAddresses[0].Ipaddress
+	lb.ipAddrID = l.PublicIpAddresses[0].Id
+
+	return true, nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.
@@ -784,8 +960,11 @@ func (lb *loadBalancer) updateLoadBalancerRule(lbRuleName string, protocol LoadB
 	p.SetProtocol(protocol.CSProtocol())
 
 	_, err := lb.LoadBalancer.UpdateLoadBalancerRule(p)
+	if err != nil {
+		return fmt.Errorf("failed to update loadbalancer rule with ID %s: %w", lbRule.Id, err)
+	}
 
-	return err
+	return nil
 }
 
 // createLoadBalancerRule creates a new load balancer rule and returns its ID.
@@ -933,6 +1112,10 @@ func symmetricDifference(hostIDs []string, lbInstances []*cloudstack.VirtualMach
 
 	var remove []string //nolint:prealloc
 	for _, instance := range lbInstances {
+		if instance == nil {
+			continue
+		}
+
 		if newIDs[instance.Id] {
 			delete(newIDs, instance.Id)
 
@@ -1088,12 +1271,13 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	// delete all other rules that didn't match the CIDR list
 	// do this first to prevent CS rule conflict errors
 	klog.V(4).Infof("Firewall rules to be deleted for %v: %v", lb.ipAddr, rulesMapToString(filtered))
+	var deleteErr error
 	for rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
-		_, err = lb.Firewall.DeleteFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.DeleteFirewallRule(p); err != nil {
 			// report the error, but keep on deleting the other rules
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			deleteErr = err
 		}
 	}
 
@@ -1104,15 +1288,15 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 		p.SetCidrlist(allowedCIDRs)
 		p.SetStartport(publicPort)
 		p.SetEndport(publicPort)
-		_, err = lb.Firewall.CreateFirewallRule(p)
-		if err != nil {
+		if _, err = lb.Firewall.CreateFirewallRule(p); err != nil {
 			// return immediately if we can't create the new rule
 			return false, fmt.Errorf("error creating new firewall rule for public IP %v, proto %v, port %v, allowed %v: %w", publicIPID, protocol, publicPort, allowedCIDRs, err)
 		}
 	}
 
-	// return true (because we changed something), but also the last error if deleting one old rule failed
-	return true, err
+	changed := match == nil || len(filtered) > 0
+
+	return changed, deleteErr
 }
 
 // deleteFirewallRule deletes the firewall rule associated with the ip:port:protocol combo
@@ -1139,18 +1323,20 @@ func (lb *loadBalancer) deleteFirewallRule(publicIPID string, publicPort int, pr
 	}
 
 	// delete all rules
+	var errs error
 	deleted := false
 	for _, rule := range filtered {
 		p := lb.Firewall.NewDeleteFirewallRuleParams(rule.Id)
 		_, err = lb.Firewall.DeleteFirewallRule(p)
 		if err != nil {
 			klog.Errorf("Error deleting old firewall rule %v: %v", rule.Id, err)
+			errs = errors.Join(errs, fmt.Errorf("error deleting old firewall rule %v: %w", rule.Id, err))
 		} else {
 			deleted = true
 		}
 	}
 
-	return deleted, err
+	return deleted, errs
 }
 
 // getLoadBalancerSourceRanges first tries to parse and verify loadBalancerSourceRanges field from a Service object.
@@ -1224,10 +1410,52 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	return defaultSetting
 }
 
+// getLoadBalancerAddress returns the desired load balancer IP address.
+// It checks the ServiceAnnotationLoadBalancerAddress annotation first (preferred),
+// then falls back to the deprecated spec.LoadBalancerIP field.
+func getLoadBalancerAddress(service *corev1.Service) string {
+	if service == nil {
+		return ""
+	}
+	if addr := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, ""); addr != "" {
+		return addr
+	}
+
+	return service.Spec.LoadBalancerIP //nolint:staticcheck // deprecated but kept as fallback
+}
+
+// getLoadBalancerID returns the stored load balancer public IP UUID from the service annotation.
+func getLoadBalancerID(service *corev1.Service) string {
+	return getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerID, "")
+}
+
+// getLoadBalancerNetworkID returns the stored load balancer network UUID from the service annotation.
+func getLoadBalancerNetworkID(service *corev1.Service) string {
+	return getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID, "")
+}
+
 // setServiceAnnotation is used to create/set or update an annotation on the Service object.
 func setServiceAnnotation(service *corev1.Service, key, value string) {
 	if service.ObjectMeta.Annotations == nil {
 		service.ObjectMeta.Annotations = map[string]string{}
 	}
 	service.ObjectMeta.Annotations[key] = value
+}
+
+// deleteServiceAnnotation removes an annotation from the Service object.
+func deleteServiceAnnotation(service *corev1.Service, key string) {
+	if service.ObjectMeta.Annotations == nil {
+		return
+	}
+	delete(service.ObjectMeta.Annotations, key)
+}
+
+// deleteLoadBalancerAnnotations removes all CloudStack load balancer annotations from the service.
+func deleteLoadBalancerAnnotations(service *corev1.Service) {
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyProtocol)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerLoadbalancerHostname)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerKeepIP)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerID)
+	deleteServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID)
 }

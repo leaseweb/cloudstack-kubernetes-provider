@@ -31,6 +31,10 @@ import (
 )
 
 func (cs *CSCloud) nodeAddresses(instance *cloudstack.VirtualMachine) ([]corev1.NodeAddress, error) {
+	if instance == nil {
+		return nil, errors.New("instance is nil")
+	}
+
 	if len(instance.Nic) == 0 {
 		return nil, errors.New("instance does not have an internal IP")
 	}
