@@ -1,6 +1,37 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.7.0 (2026-03-05)
+---
+
+### Features
+
+- Add load-balancer-id and network-id annotations with ID-based lookup
+- Make load balancer address annotation user-settable with keep-ip support
+- Clean up load balancer annotations in EnsureLoadBalancerDeleted
+
+### Bug Fixes
+
+- Prevent public IP orphaning under partial failure conditions
+- Validate target IP before tearing down existing load balancer
+- Address multiple bugs found during code audit
+- Enable gosec and wrapcheck linters and fix issues
+
+### Refactoring
+
+- Remove live IP reassignment support from load balancer
+
+### Dependencies
+
+- Updated K8s deps to v1.33.9
+- Updated mock to v0.6.0, testify to v1.11.1
+
+### Maintenance
+
+- Move documentation to docs/ folder and update README
+- Rename CHANGES.md to CHANGELOG.md and add missing releases
+- Remove unused scripts (get_kubernetes_deps.sh, performrelease.sh)
+
 v1.6.2 (2026-02-20)
 ---
 
