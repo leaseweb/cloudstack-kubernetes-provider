@@ -667,7 +667,8 @@ func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadB
 		return nil, fmt.Errorf("error retrieving load balancer rules by IP ID %v: %w", ipAddrID, err)
 	}
 
-	for _, lbRule := range l.LoadBalancerRules {
+	filtered := filterRulesByPrefix(l.LoadBalancerRules, lb.name+"-")
+	for _, lbRule := range filtered {
 		lb.rules[lbRule.Name] = lbRule
 
 		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
