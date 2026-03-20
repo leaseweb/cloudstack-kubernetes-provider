@@ -4172,8 +4172,8 @@ func TestGetLoadBalancerByID(t *testing.T) {
 		listResp := &cloudstack.ListLoadBalancerRulesResponse{
 			Count: 2,
 			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
-				{Name: "lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
-				{Name: "lb-tcp-443", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "my-lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "my-lb-tcp-443", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
 			},
 		}
 
@@ -4201,6 +4201,51 @@ func TestGetLoadBalancerByID(t *testing.T) {
 		}
 		if lb.networkID != "net-1" {
 			t.Errorf("networkID = %q, want %q", lb.networkID, "net-1")
+		}
+	})
+
+	t.Run("filters out rules not matching LB name prefix", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		listParams := &cloudstack.ListLoadBalancerRulesParams{}
+
+		// API returns rules from multiple services sharing the same IP
+		listResp := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 4,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Name: "my-lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "my-lb-tcp-443", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "other-svc-tcp-8080", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "another-svc-tcp-9090", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+			},
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(listParams)
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(listResp, nil)
+
+		cs := &CSCloud{
+			client: &cloudstack.CloudStackClient{
+				LoadBalancer: mockLB,
+			},
+		}
+
+		lb, err := cs.getLoadBalancerByID("my-lb", "ip-1", "net-1")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lb.rules) != 2 {
+			t.Fatalf("expected 2 rules (only my-lb- prefix), got %d", len(lb.rules))
+		}
+		if _, ok := lb.rules["my-lb-tcp-80"]; !ok {
+			t.Error("expected rule my-lb-tcp-80 to be present")
+		}
+		if _, ok := lb.rules["my-lb-tcp-443"]; !ok {
+			t.Error("expected rule my-lb-tcp-443 to be present")
+		}
+		if _, ok := lb.rules["other-svc-tcp-8080"]; ok {
+			t.Error("rule other-svc-tcp-8080 should have been filtered out")
 		}
 	})
 
@@ -4341,7 +4386,7 @@ func TestGetLoadBalancerOrchestrator(t *testing.T) {
 		idResp := &cloudstack.ListLoadBalancerRulesResponse{
 			Count: 1,
 			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
-				{Name: "lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
+				{Name: "my-lb-tcp-80", Publicip: "1.2.3.4", Publicipid: "ip-1", Networkid: "net-1"},
 			},
 		}
 
