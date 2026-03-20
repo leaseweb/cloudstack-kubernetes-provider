@@ -101,6 +101,8 @@ func ProtocolFromServicePort(port corev1.ServicePort, service *corev1.Service) L
 // CloudStack load balancer protocol name.
 func ProtocolFromLoadBalancer(protocol string) LoadBalancerProtocol {
 	switch protocol {
+	case "":
+		fallthrough
 	case ProtoTCP:
 		return LoadBalancerProtocolTCP
 	case ProtoUDP:
