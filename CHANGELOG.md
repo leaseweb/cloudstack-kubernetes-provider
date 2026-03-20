@@ -1,6 +1,14 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.7.1 (2026-03-20)
+---
+
+### Bug Fixes
+
+- Filter LB rules by name prefix in getLoadBalancerByID
+- Default to TCP protocol when proto empty
+
 v1.7.0 (2026-03-05)
 ---
 
