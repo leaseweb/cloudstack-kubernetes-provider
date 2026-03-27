@@ -1444,10 +1444,10 @@ func setServiceAnnotation(service *corev1.Service, key, value string) {
 
 // deleteServiceAnnotation removes an annotation from the Service object.
 func deleteServiceAnnotation(service *corev1.Service, key string) {
-	if service.ObjectMeta.Annotations == nil {
+	if service.Annotations == nil {
 		return
 	}
-	delete(service.ObjectMeta.Annotations, key)
+	delete(service.Annotations, key)
 }
 
 // deleteLoadBalancerAnnotations removes all CloudStack load balancer annotations from the service.
