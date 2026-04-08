@@ -2,6 +2,22 @@ apiVersion: v1
 entries:
   cloud-controller-manager:
   - apiVersion: v2
+    appVersion: 1.8.0
+    created: "2026-04-08T13:40:08.833387503Z"
+    description: CloudStack Cloud Controller Manager Helm chart
+    digest: 07e0accc40fb8dd353c72209858a3281c8d5cbd0f5d4317b0add3137c3e1ce41
+    keywords:
+    - cloudControlerManger
+    - cloudProvider
+    - cloudStack
+    name: cloud-controller-manager
+    sources:
+    - https://github.com/leaseweb/cloudstack-kubernetes-provider
+    type: application
+    urls:
+    - https://github.com/leaseweb/cloudstack-kubernetes-provider/releases/download/cloud-controller-manager-1.6.0/cloud-controller-manager-1.6.0.tgz
+    version: 1.6.0
+  - apiVersion: v2
     appVersion: 1.7.1
     created: "2026-03-20T14:15:46.647635817Z"
     description: CloudStack Cloud Controller Manager Helm chart
@@ -257,4 +273,4 @@ entries:
     urls:
     - https://github.com/Leaseweb/cloudstack-kubernetes-provider/releases/download/cloud-controller-manager-1.0.0/cloud-controller-manager-1.0.0.tgz
     version: 1.0.0
-generated: "2026-03-20T14:15:46.647753357Z"
+generated: "2026-04-08T13:40:08.833512468Z"
