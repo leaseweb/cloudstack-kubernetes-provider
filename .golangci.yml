@@ -1,63 +1,83 @@
-linters-settings:
-  gci:
-    sections:
-      - standard
-      - default
-      - prefix(github.com/apache/cloudstack-kubernetes-provider)
-  gofumpt:
-    module-path: "github.com/apache/cloudstack-kubernetes-provider"
-  nolintlint:
-    # https://github.com/golangci/golangci-lint/issues/3228
-    allow-unused: true
-
-linters:
-  disable:
-    - goheader
-    - depguard
-    - mnd
-    - varnamelen
-    - testpackage
-    - tagliatelle
-    - paralleltest
-    - ireturn
-    - err113
-    - gochecknoglobals
-    - wsl
-    - exhaustive
-    - nosprintfhostport
-    - nonamedreturns
-    - interfacebloat
-    - exhaustruct
-    - lll
-    - gomoddirectives
-    - godox
-    - gochecknoinits
-    - funlen
-    - dupl
-    - cyclop
-    - inamedparam
-    # deprecated linters
-    - tenv
-  enable-all: true
-
-issues:
-  # Maximum issues count per one linter. Set to 0 to disable. Default is 50.
-  max-issues-per-linter: 0
-  # Maximum count of issues with the same text. Set to 0 to disable. Default is 3.
-  max-same-issues: 0
-  exclude-rules:
-    - path: (.+)_test.go$
-      linters:
-        - gocognit
-        - goconst
-        - gocyclo
-        - errcheck
-        - dupl
-        - gosec
-        - forbidigo
-        - maintidx
-
+version: "2"
 run:
-  timeout: 10m
   allow-parallel-runners: true
-
+linters:
+  default: all
+  disable:
+    - cyclop
+    - depguard
+    - dupl
+    - err113
+    - exhaustive
+    - exhaustruct
+    - funlen
+    - gochecknoglobals
+    - gochecknoinits
+    - godox
+    - goheader
+    - gomoddirectives
+    - inamedparam
+    - interfacebloat
+    - ireturn
+    - lll
+    - mnd
+    - nonamedreturns
+    - nosprintfhostport
+    - paralleltest
+    - tagliatelle
+    - testpackage
+    - varnamelen
+    - wsl
+    # TODO: Following Lint issues need to be fixed:
+    - embeddedstructfieldcheck
+    - funcorder
+    - wsl_v5
+    - noinlineerr
+  settings:
+    nolintlint:
+      allow-unused: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - dupl
+          - errcheck
+          - forbidigo
+          - gocognit
+          - goconst
+          - gocyclo
+          - gosec
+          - maintidx
+        path: (.+)_test.go$
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/apache/cloudstack-kubernetes-provider)
+    gofumpt:
+      module-path: github.com/apache/cloudstack-kubernetes-provider
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

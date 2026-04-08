@@ -74,7 +74,7 @@ func sanitizeLabel(value string) string {
 }
 
 // Sprintf255 behaves like fmt.Sprintf but limits the output to 255 characters.
-func Sprintf255(format string, a ...interface{}) string {
+func Sprintf255(format string, a ...any) string {
 	result := fmt.Sprintf(format, a...)
 	if len(result) > 255 {
 		return result[:255]

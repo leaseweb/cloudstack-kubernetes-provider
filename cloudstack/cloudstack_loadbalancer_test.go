@@ -733,7 +733,7 @@ func TestRulesMapToString(t *testing.T) {
 				}
 				for _, expectedRule := range expectedRules {
 					found := false
-					for _, part := range parts {
+					for _, part := range parts { //nolint:modernize
 						if part == expectedRule {
 							found = true
 
