@@ -1,6 +1,13 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.8.0 (2026-04-08)
+---
+### Features
+
+- feat: K8s 1.35 Support and K8s Dependencies update to v0.34.3
+- feat(lint): Update golangci-lint to 2.7.2
+
 v1.7.1 (2026-03-20)
 ---
 
