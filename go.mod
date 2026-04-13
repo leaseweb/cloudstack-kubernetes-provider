@@ -3,7 +3,7 @@ module github.com/apache/cloudstack-kubernetes-provider
 go 1.24.0
 
 require (
-	github.com/apache/cloudstack-go/v2 v2.19.0
+	github.com/apache/cloudstack-go/v2 v2.17.1
 	github.com/google/go-cmp v0.7.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.6.0
