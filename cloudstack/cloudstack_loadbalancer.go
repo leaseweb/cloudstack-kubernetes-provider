@@ -742,7 +742,7 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
 	var unmatchedNodes []string
 	for _, node := range nodes {
-		shortName := strings.Split(strings.ToLower(node.Name), ".")[0]
+		shortName, _, _ := strings.Cut(strings.ToLower(node.Name), ".")
 		if !matchedNames[shortName] {
 			unmatchedNodes = append(unmatchedNodes, node.Name)
 		}
