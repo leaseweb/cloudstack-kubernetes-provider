@@ -10,12 +10,14 @@ linters:
     - err113
     - exhaustive
     - exhaustruct
+    - exhaustruct_v5
     - funlen
     - gochecknoglobals
     - gochecknoinits
     - godox
     - goheader
     - gomoddirectives
+    - gomodguard
     - inamedparam
     - interfacebloat
     - ireturn
@@ -53,6 +55,7 @@ linters:
           - gocyclo
           - gosec
           - maintidx
+          - prealloc
         path: (.+)_test.go$
     paths:
       - third_party$
