@@ -4547,3 +4547,327 @@ func TestGetLoadBalancerOrchestrator(t *testing.T) {
 		}
 	})
 }
+
+// lbTestService builds a Service whose load balancer name resolves to
+// "K8s_svc_cluster_default_foo" for clusterName "cluster".
+func lbTestService(annotations map[string]string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "foo",
+			Namespace:   "default",
+			Annotations: annotations,
+		},
+	}
+}
+
+func TestGetLoadBalancer(t *testing.T) {
+	const ruleName = "K8s_svc_cluster_default_foo-tcp-80"
+
+	t.Run("returns status when rules exist", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Id: "rule-1", Name: ruleName, Publicip: "10.0.0.1", Publicipid: "ip-1"},
+			},
+		}, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		status, exists, err := cs.GetLoadBalancer(t.Context(), "cluster", lbTestService(nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !exists {
+			t.Fatal("expected the load balancer to exist")
+		}
+		if len(status.Ingress) != 1 || status.Ingress[0].IP != "10.0.0.1" {
+			t.Fatalf("unexpected ingress: %+v", status.Ingress)
+		}
+	})
+
+	t.Run("reports missing when no rules exist", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		setupGetLoadBalancerByNameEmpty(mockLB)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		status, exists, err := cs.GetLoadBalancer(t.Context(), "cluster", lbTestService(nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if exists {
+			t.Fatal("expected the load balancer to be reported as missing")
+		}
+		if status != nil {
+			t.Fatalf("expected a nil status, got %+v", status)
+		}
+	})
+
+	t.Run("ignores rules belonging to another service", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		// CloudStack's SetKeyword is a LIKE %keyword% match, so a longer service
+		// name can come back for a shorter one. It must not be treated as ours.
+		foreign := &cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Id: "rule-9", Name: "K8s_svc_cluster_default_foobar-tcp-80", Publicip: "10.0.0.9"},
+			},
+		}
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(foreign, nil)
+		// Legacy name fallback also sees only the foreign rule.
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(foreign, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		_, exists, err := cs.GetLoadBalancer(t.Context(), "cluster", lbTestService(nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if exists {
+			t.Fatal("expected a rule from another service to be ignored")
+		}
+	})
+
+	t.Run("resolves via the ID annotation", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Id: "rule-1", Name: ruleName, Publicip: "10.0.0.2", Publicipid: "ip-2", Networkid: "net-1"},
+			},
+		}, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		service := lbTestService(map[string]string{
+			ServiceAnnotationLoadBalancerID:        "ip-2",
+			ServiceAnnotationLoadBalancerNetworkID: "net-1",
+		})
+
+		status, exists, err := cs.GetLoadBalancer(t.Context(), "cluster", service)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !exists {
+			t.Fatal("expected the load balancer to exist")
+		}
+		if status.Ingress[0].IP != "10.0.0.2" {
+			t.Fatalf("unexpected ingress IP: %v", status.Ingress[0].IP)
+		}
+	})
+
+	t.Run("propagates lookup errors", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nil, errors.New("api down"))
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		_, exists, err := cs.GetLoadBalancer(t.Context(), "cluster", lbTestService(nil))
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if exists {
+			t.Fatal("expected exists to be false when the lookup fails")
+		}
+		if !strings.Contains(err.Error(), "api down") {
+			t.Fatalf("expected the underlying error to be wrapped, got: %v", err)
+		}
+	})
+}
+
+func TestUpdateLoadBalancer(t *testing.T) {
+	const ruleName = "K8s_svc_cluster_default_foo-tcp-80"
+
+	nodes := []*corev1.Node{
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}},
+	}
+
+	// setupGetLoadBalancerWithRule makes the name-based lookup return a single rule.
+	setupGetLoadBalancerWithRule := func(mockLB *cloudstack.MockLoadBalancerServiceIface) {
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(&cloudstack.ListLoadBalancerRulesResponse{
+			Count: 1,
+			LoadBalancerRules: []*cloudstack.LoadBalancerRule{
+				{Id: "rule-1", Name: ruleName, Publicip: "10.0.0.1", Publicipid: "ip-1"},
+			},
+		}, nil)
+	}
+
+	// expectRuleInstances makes the rule report the given VMs as currently assigned.
+	expectRuleInstances := func(mockLB *cloudstack.MockLoadBalancerServiceIface, vmIDs ...string) {
+		instances := make([]*cloudstack.VirtualMachine, 0, len(vmIDs))
+		for _, id := range vmIDs {
+			instances = append(instances, &cloudstack.VirtualMachine{Id: id})
+		}
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").
+			Return(&cloudstack.ListLoadBalancerRuleInstancesParams{})
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).
+			Return(&cloudstack.ListLoadBalancerRuleInstancesResponse{
+				Count:                     len(instances),
+				LoadBalancerRuleInstances: instances,
+			}, nil)
+	}
+
+	t.Run("assigns a newly added host", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerWithRule(mockLB)
+		setupVerifyHosts(mockVM)
+		expectRuleInstances(mockLB) // rule currently has no instances
+
+		mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(&cloudstack.AssignToLoadBalancerRuleParams{})
+		mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		if err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("removes a host that is no longer a node", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerWithRule(mockLB)
+		setupVerifyHosts(mockVM)
+		expectRuleInstances(mockLB, "vm-old") // vm-old is gone, vm-1 is new
+
+		mockLB.EXPECT().NewAssignToLoadBalancerRuleParams("rule-1").Return(&cloudstack.AssignToLoadBalancerRuleParams{})
+		mockLB.EXPECT().AssignToLoadBalancerRule(gomock.Any()).Return(&cloudstack.AssignToLoadBalancerRuleResponse{}, nil)
+		mockLB.EXPECT().NewRemoveFromLoadBalancerRuleParams("rule-1").Return(&cloudstack.RemoveFromLoadBalancerRuleParams{})
+		mockLB.EXPECT().RemoveFromLoadBalancerRule(gomock.Any()).Return(&cloudstack.RemoveFromLoadBalancerRuleResponse{}, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		if err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("makes no calls when the host set already matches", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerWithRule(mockLB)
+		setupVerifyHosts(mockVM)
+		expectRuleInstances(mockLB, "vm-1")
+
+		// No Assign/Remove expectations: ctrl.Finish fails if either is called.
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		if err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("is a no-op when the load balancer has no rules", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerByNameEmpty(mockLB)
+		setupVerifyHosts(mockVM)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		if err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("propagates load balancer lookup errors", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockLB.EXPECT().NewListLoadBalancerRulesParams().Return(&cloudstack.ListLoadBalancerRulesParams{})
+		mockLB.EXPECT().ListLoadBalancerRules(gomock.Any()).Return(nil, errors.New("api down"))
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB}}
+
+		err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes)
+		if err == nil || !strings.Contains(err.Error(), "api down") {
+			t.Fatalf("expected the lookup error to be propagated, got: %v", err)
+		}
+	})
+
+	t.Run("propagates host verification errors", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerWithRule(mockLB)
+
+		// No VM matches node-1, so verifyHosts cannot resolve any host.
+		mockVM.EXPECT().NewListVirtualMachinesParams().Return(&cloudstack.ListVirtualMachinesParams{})
+		mockVM.EXPECT().ListVirtualMachines(gomock.Any()).Return(&cloudstack.ListVirtualMachinesResponse{
+			Count:           1,
+			VirtualMachines: []*cloudstack.VirtualMachine{{Id: "vm-2", Name: "other", Nic: []cloudstack.Nic{{Networkid: "net-1"}}}},
+		}, nil)
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes)
+		if err == nil || !strings.Contains(err.Error(), "could not match any of the") {
+			t.Fatalf("expected a host matching error, got: %v", err)
+		}
+	})
+
+	t.Run("propagates reconcile errors", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+
+		setupGetLoadBalancerWithRule(mockLB)
+		setupVerifyHosts(mockVM)
+
+		mockLB.EXPECT().NewListLoadBalancerRuleInstancesParams("rule-1").
+			Return(&cloudstack.ListLoadBalancerRuleInstancesParams{})
+		mockLB.EXPECT().ListLoadBalancerRuleInstances(gomock.Any()).Return(nil, errors.New("instance list failed"))
+
+		cs := &CSCloud{client: &cloudstack.CloudStackClient{LoadBalancer: mockLB, VirtualMachine: mockVM}}
+
+		err := cs.UpdateLoadBalancer(t.Context(), "cluster", lbTestService(nil), nodes)
+		if err == nil || !strings.Contains(err.Error(), "error retrieving associated instances") {
+			t.Fatalf("expected a reconcile error, got: %v", err)
+		}
+	})
+}
