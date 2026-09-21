@@ -54,6 +54,10 @@ jobs:
     name: Release
     runs-on: ubuntu-22.04
 
+    # Needed by softprops/action-gh-release to create the release and upload assets
+    permissions:
+      contents: write
+
     # Run only if previous job has succeeded
     needs: [build-and-push]
 
@@ -72,23 +76,13 @@ jobs:
           echo "---" >> manifest.yaml
           sed -E "s|image: +cloudstack-kubernetes-provider|image: ${REGISTRY_NAME}/${IMAGE_NAME}:${VERSION}|" deploy/k8s/deployment.yaml >> manifest.yaml
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # tag_name and name both default to github.ref_name, so the release is
+      # titled with the bare tag (v1.2.3) rather than the full ref.
+      - name: Create release
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
+          files: manifest.yaml
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: manifest.yaml
-          asset_name: manifest.yaml
-          asset_content_type: application/x-yaml
