@@ -1,6 +1,30 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.10.0 (2026-09-21)
+---
+
+### Dependencies
+
+- Updated K8s deps to v0.36.4
+- Updated testify to v1.12.1
+- Bump actions/checkout from 6 to 7
+- Bump actions/setup-go from 6 to 7
+- Bump actions/setup-python from 6 to 7
+- Bump azure/setup-helm from 5.0.0 to 5.0.1
+- Bump helm/kind-action from 1.14.0 to 1.15.0
+
+### Testing
+
+- Add unit tests for GetLoadBalancer and UpdateLoadBalancer
+- Enable the race detector in the Makefile test target
+
+### Maintenance
+
+- Run lint and tests before pushing release images
+- Replace archived release actions with softprops/action-gh-release
+- Limit Dependabot gomod updates to direct dependencies
+
 v1.9.0 (2026-08-27)
 ---
 
