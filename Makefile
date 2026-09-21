@@ -81,8 +81,9 @@ cloudstack-ccm: ${CMD_SRC}
 		-ldflags ${LDFLAGS} \
 	 	-o $@ $^
 
+# -race requires cgo, so this target overrides any CGO_ENABLED=0 in the environment.
 test:
-	go test -v ./...
+	CGO_ENABLED=1 go test -race -v ./...
 	go vet ./...
 	@(echo "gofmt -l"; FMTFILES="$$(gofmt -l .)"; if test -n "$${FMTFILES}"; then echo "Go files that need to be reformatted (use 'go fmt'):\n$${FMTFILES}"; exit 1; fi)
 
