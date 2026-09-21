@@ -29,6 +29,15 @@ updates:
     schedule:
       interval: weekly
       day: sunday
+    # Only propose updates for direct dependencies. 80 of the 92 indirect
+    # requirements in go.mod are pulled in by k8s.io/*, and bumping one ahead of
+    # upstream writes an explicit version into the indirect require block that
+    # then has to be carried and removed by hand once k8s catches up. Those
+    # versions should be left to arrive via MVS with the next k8s.io/* release.
+    # Dependabot alerts still surface indirect vulnerabilities in the security
+    # tab; this only stops the automated pull requests.
+    allow:
+      - dependency-type: "direct"
     ignore:
       - dependency-name: "k8s.io/api"
         update-types: ["version-update:semver-minor"]
