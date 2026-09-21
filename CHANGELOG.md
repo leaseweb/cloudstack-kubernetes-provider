@@ -1,6 +1,32 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.9.0 (2026-08-27)
+---
+
+### Features
+
+- feat(deps): Update K8s deps to v0.35.8 for K8s 1.36 support
+
+### Maintenance
+
+- chore(build): Update to Go 1.26 / golangci-lint v2.13.1
+
+### Dependencies
+
+- Bump azure/setup-helm from 4.3.1 to 5.0.0
+- Bump helm/kind-action from 1.13.0 to 1.14.0
+- Bump helm/chart-testing-action from 2.7.0 to 2.8.0
+- Bump docker/login-action from 3 to 4
+- Bump docker/setup-buildx-action from 3 to 4
+
+v1.8.1 (2026-04-13)
+---
+
+### Dependencies
+
+- Rollback cloudstack-go to v2.17.1
+
 v1.8.0 (2026-04-08)
 ---
 ### Features
