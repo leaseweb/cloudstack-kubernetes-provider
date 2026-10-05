@@ -132,7 +132,11 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 		// Always start the shared backoff, also when this request is not retried.
 		delay := t.backoff.throttledAt(epoch, retryAfter(resp))
 		if attempt >= t.maxRetries || (req.Body != nil && req.GetBody == nil) {
-			klog.Warningf("CloudStack API throttled the request (HTTP 429), giving up after %d retries", attempt)
+			if attempt >= t.maxRetries {
+				klog.Warningf("CloudStack API throttled the request (HTTP 429), giving up after %d retries", attempt)
+			} else {
+				klog.Warning("CloudStack API throttled the request (HTTP 429), not retrying because the request body cannot be sent again")
+			}
 			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 
 			return resp, nil

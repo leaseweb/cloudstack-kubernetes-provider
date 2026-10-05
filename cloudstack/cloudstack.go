@@ -135,14 +135,14 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 			cloudstack.WithHTTPClient(newHTTPClient(cfg.Global.SSLNoVerify, qps, burst)))
 	}
 
+	if cs.client == nil {
+		return nil, errors.New("cloud provider configuration incomplete: api-url, api-key, and secret-key are all required")
+	}
+
 	if qps > 0 {
 		klog.Infof("CloudStack API rate limit: %v QPS, burst %d", qps, burst)
 	} else {
 		klog.Info("CloudStack API rate limit is disabled")
-	}
-
-	if cs.client == nil {
-		return nil, errors.New("cloud provider configuration incomplete: api-url, api-key, and secret-key are all required")
 	}
 
 	return cs, nil
