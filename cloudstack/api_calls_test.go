@@ -560,3 +560,22 @@ func TestVMCache(t *testing.T) {
 		}
 	})
 }
+
+func TestNeedsFreshListTimestampPrecision(t *testing.T) {
+	fetchedAt := time.Date(2026, 1, 1, 12, 0, 0, 300*int(time.Millisecond), time.UTC)
+	tests := []struct {
+		created time.Time
+		want    bool
+	}{
+		// The node was created at 12:00:00.800, after the fetch. The API server stores 12:00:00.
+		{time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), true},
+		{time.Date(2026, 1, 1, 12, 0, 1, 0, time.UTC), true},
+		{time.Date(2026, 1, 1, 11, 59, 59, 0, time.UTC), false},
+	}
+	for _, tt := range tests {
+		nodes := []*corev1.Node{testNode("node-1", "", tt.created)}
+		if got := (hostMatch{}).needsFreshList(nodes, fetchedAt); got != tt.want {
+			t.Errorf("needsFreshList(created %v) = %v, want %v", tt.created, got, tt.want)
+		}
+	}
+}

@@ -857,8 +857,11 @@ func (m hostMatch) needsFreshList(nodes []*corev1.Node, fetchedAt time.Time) boo
 		return true
 	}
 
+	// The API server stores the creation time of a node in whole seconds. A node that was created in the same
+	// second as the fetch may be newer than the list, so it also needs a new list.
+	fetchedAtSecond := fetchedAt.Truncate(time.Second)
 	for _, node := range nodes {
-		if node.CreationTimestamp.After(fetchedAt) {
+		if !node.CreationTimestamp.Time.Before(fetchedAtSecond) {
 			return true
 		}
 	}
