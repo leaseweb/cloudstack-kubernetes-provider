@@ -157,10 +157,10 @@ func isAPIThrottled(err error) bool {
 // backoff in which the request is sent.
 func (t *rateLimitedTransport) waitToSend(ctx context.Context) (uint64, error) {
 	for {
-		if err := t.backoff.wait(ctx); err != nil {
+		epoch, err := t.backoff.waitEpoch(ctx)
+		if err != nil {
 			return 0, fmt.Errorf("waiting for CloudStack API throttling backoff: %w", err)
 		}
-		epoch := t.backoff.currentEpoch()
 
 		if t.limiter != nil {
 			if err := t.limiter.Wait(ctx); err != nil {
@@ -240,19 +240,28 @@ func newThrottleBackoff() *throttleBackoff {
 // wait blocks until the shared backoff ends, or until ctx is done. When another request extends the
 // backoff during the sleep, wait sleeps again until the new end.
 func (b *throttleBackoff) wait(ctx context.Context) error {
+	_, err := b.waitEpoch(ctx)
+
+	return err
+}
+
+// waitEpoch is wait, and also returns the epoch in which the backoff ended. It reads the epoch under the same
+// lock as the end of the backoff, so a backoff that starts after the end is in a later epoch.
+func (b *throttleBackoff) waitEpoch(ctx context.Context) (uint64, error) {
 	var waited time.Time
 	for {
 		b.mu.Lock()
 		until := b.until
 		d := until.Sub(b.now())
+		epoch := b.epoch
 		b.mu.Unlock()
 
 		if d <= 0 || until.Equal(waited) {
-			return nil
+			return epoch, nil
 		}
 
 		if err := b.sleep(ctx, d); err != nil {
-			return err
+			return 0, err
 		}
 		waited = until
 	}

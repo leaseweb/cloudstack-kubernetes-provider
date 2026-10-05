@@ -585,3 +585,33 @@ func TestNewCSCloudNegativeQPS(t *testing.T) {
 		}
 	}
 }
+
+func TestThrottleBackoffWaitEpoch(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	b := newThrottleBackoff()
+	b.now = func() time.Time { return now }
+	b.sleep = func(_ context.Context, d time.Duration) error {
+		now = now.Add(d)
+
+		return nil
+	}
+
+	if epoch, err := b.waitEpoch(t.Context()); err != nil || epoch != 0 {
+		t.Fatalf("waitEpoch() = %d, %v, want 0, nil", epoch, err)
+	}
+
+	b.throttled(0)
+	epoch, err := b.waitEpoch(t.Context())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if epoch != b.currentEpoch() {
+		t.Errorf("epoch = %d, want %d", epoch, b.currentEpoch())
+	}
+
+	// A backoff that starts after the end of the wait is in a later epoch.
+	b.throttled(0)
+	if epoch == b.currentEpoch() {
+		t.Errorf("epoch = %d, want a later epoch", epoch)
+	}
+}
