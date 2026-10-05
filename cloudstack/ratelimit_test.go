@@ -507,3 +507,43 @@ func TestIsAPIThrottled(t *testing.T) {
 		}
 	}
 }
+
+// epochChangingLimiter is a rate limiter that calls onWait during the first wait.
+type epochChangingLimiter struct {
+	flowcontrol.RateLimiter
+	waits  int
+	onWait func()
+}
+
+func (l *epochChangingLimiter) Wait(context.Context) error {
+	l.waits++
+	if l.waits == 1 {
+		l.onWait()
+	}
+
+	return nil
+}
+
+func TestWaitToSend(t *testing.T) {
+	t.Run("waits for a backoff that starts during the wait for the rate limit", func(t *testing.T) {
+		limiter := &epochChangingLimiter{}
+		tr, sleeps := newTestTransport(limiter)
+		var started time.Duration
+		// Another request is throttled while this request waits for the rate limit.
+		limiter.onWait = func() { started = tr.backoff.throttled(0) }
+
+		epoch, err := tr.waitToSend(t.Context())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if limiter.waits != 2 {
+			t.Errorf("rate limit waits = %d, want 2", limiter.waits)
+		}
+		if len(*sleeps) != 1 || (*sleeps)[0] > started {
+			t.Errorf("sleeps = %v, want one backoff sleep of at most %v", *sleeps, started)
+		}
+		if epoch != tr.backoff.currentEpoch() {
+			t.Errorf("epoch = %d, want %d", epoch, tr.backoff.currentEpoch())
+		}
+	})
+}

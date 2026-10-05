@@ -104,14 +104,9 @@ type rateLimitedTransport struct {
 // RoundTrip implements http.RoundTripper.
 func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		if err := t.backoff.wait(req.Context()); err != nil {
-			return nil, fmt.Errorf("waiting for CloudStack API throttling backoff: %w", err)
-		}
-
-		if t.limiter != nil {
-			if err := t.limiter.Wait(req.Context()); err != nil {
-				return nil, fmt.Errorf("waiting for CloudStack API rate limit: %w", err)
-			}
+		epoch, err := t.waitToSend(req.Context())
+		if err != nil {
+			return nil, err
 		}
 
 		attemptReq, err := requestForAttempt(req, attempt)
@@ -119,7 +114,6 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 			return nil, err
 		}
 
-		epoch := t.backoff.currentEpoch()
 		ctx, cancel := context.WithTimeout(req.Context(), t.attemptTimeout)
 		resp, err := t.next.RoundTrip(attemptReq.WithContext(ctx))
 		if err != nil {
@@ -156,6 +150,28 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 // cloudstack-go returns the error of a rejected request as text only, so the text is checked.
 func isAPIThrottled(err error) bool {
 	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("CloudStack API error %d ", http.StatusTooManyRequests))
+}
+
+// waitToSend blocks until the shared backoff ends and the rate limit allows a request. If a rejection starts a new
+// backoff while the request waits for the rate limit, it waits for that backoff too. It returns the epoch of the
+// backoff in which the request is sent.
+func (t *rateLimitedTransport) waitToSend(ctx context.Context) (uint64, error) {
+	for {
+		if err := t.backoff.wait(ctx); err != nil {
+			return 0, fmt.Errorf("waiting for CloudStack API throttling backoff: %w", err)
+		}
+		epoch := t.backoff.currentEpoch()
+
+		if t.limiter != nil {
+			if err := t.limiter.Wait(ctx); err != nil {
+				return 0, fmt.Errorf("waiting for CloudStack API rate limit: %w", err)
+			}
+		}
+
+		if t.backoff.currentEpoch() == epoch {
+			return epoch, nil
+		}
+	}
 }
 
 // requestForAttempt returns the request to send for the given attempt. The first attempt uses the original
