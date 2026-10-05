@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -546,4 +547,41 @@ func TestWaitToSend(t *testing.T) {
 			t.Errorf("epoch = %d, want %d", epoch, tr.backoff.currentEpoch())
 		}
 	})
+}
+
+func TestThrottleBackoffSucceededAt(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	b := newThrottleBackoff()
+	b.now = func() time.Time { return now }
+
+	sentBefore := b.currentEpoch()
+	b.throttled(0)
+
+	// A request that was sent before the throttle event does not decrease the delay.
+	b.succeededAt(sentBefore)
+	if b.delay != throttleInitialDelay {
+		t.Errorf("delay = %v, want %v", b.delay, throttleInitialDelay)
+	}
+
+	// The next rejection doubles the delay.
+	b.throttled(0)
+	if b.delay != 2*throttleInitialDelay {
+		t.Errorf("delay = %v, want %v", b.delay, 2*throttleInitialDelay)
+	}
+
+	// A request that was sent after the throttle event decreases the delay.
+	b.succeededAt(b.currentEpoch())
+	if b.delay != throttleInitialDelay {
+		t.Errorf("delay = %v, want %v", b.delay, throttleInitialDelay)
+	}
+}
+
+func TestNewCSCloudNegativeQPS(t *testing.T) {
+	for _, qps := range []float64{-10, math.NaN()} {
+		cfg := &CSConfig{}
+		cfg.Global.APIRateLimitQPS = &qps
+		if _, err := newCSCloud(cfg); err == nil {
+			t.Errorf("api-rate-limit-qps = %v: expected an error", qps)
+		}
+	}
 }

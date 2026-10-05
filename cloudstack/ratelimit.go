@@ -123,7 +123,7 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests {
-			t.backoff.succeeded()
+			t.backoff.succeededAt(epoch)
 			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 
 			return resp, nil
@@ -300,12 +300,19 @@ func (b *throttleBackoff) throttledAt(epoch uint64, minDelay time.Duration) time
 	return max(b.until.Sub(now), 0)
 }
 
-// succeeded decreases the delay after a request was not throttled.
+// succeeded is succeededAt for a request that was sent in the current epoch.
 func (b *throttleBackoff) succeeded() {
+	b.succeededAt(b.currentEpoch())
+}
+
+// succeededAt decreases the delay after CloudStack did not reject a request that was sent in the given epoch.
+// A request that was sent before the last increase of the delay does not decrease it, because it was sent
+// before the throttle event and does not show that CloudStack accepts requests again.
+func (b *throttleBackoff) succeededAt(epoch uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.delay == 0 {
+	if b.delay == 0 || epoch != b.epoch {
 		return
 	}
 

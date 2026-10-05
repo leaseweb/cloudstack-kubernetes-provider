@@ -26,7 +26,7 @@ vm-cache-ttl         = <Seconds to cache the VM list for load balancer host look
 | `project-id` | No | UUID of the CloudStack project. Required when nodes are in a project |
 | `zone` | No | CloudStack zone name to scope operations to |
 | `ssl-no-verify` | No | Set to `true` to skip TLS certificate verification |
-| `api-rate-limit-qps` | No | Maximum number of CloudStack API requests per second, including async job polls. Default `10`. Set to `0` to disable the rate limit |
+| `api-rate-limit-qps` | No | Maximum number of CloudStack API requests per second, including async job polls. Default `10`. Set to `0` to disable the rate limit. Must not be negative |
 | `api-rate-limit-burst` | No | Number of requests that may exceed the QPS for a short time. Must be at least `1` when the rate limit is enabled. Default `20` |
 | `vm-cache-ttl` | No | Number of seconds that the list of VMs is cached for load balancer host lookups, so that many services share one `listVirtualMachines` call. The list is fetched again when it does not match all nodes, or when a node is newer than the list. Default `30`. Set to `0` to disable the cache |
 

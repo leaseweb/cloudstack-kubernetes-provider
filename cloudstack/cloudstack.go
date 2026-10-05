@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
@@ -102,6 +103,9 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 	qps := defaultAPIRateLimitQPS
 	if cfg.Global.APIRateLimitQPS != nil {
 		qps = *cfg.Global.APIRateLimitQPS
+		if qps < 0 || math.IsNaN(qps) {
+			return nil, fmt.Errorf("invalid cloud provider configuration: api-rate-limit-qps must not be negative, got %v", qps)
+		}
 	}
 
 	burst := defaultAPIRateLimitBurst
