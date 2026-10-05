@@ -118,6 +118,10 @@ cloudConfig:
     api-url: ""
     api-key: ""
     secret-key: ""
+    # Optional limits to protect the CloudStack management server, see docs/configuration.md
+    # api-rate-limit-qps: 10
+    # api-rate-limit-burst: 20
+    # vm-cache-ttl: 30
 
 # Log verbosity level.
 # See https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md
