@@ -244,6 +244,40 @@ func TestThrottleBackoff(t *testing.T) {
 		}
 	})
 
+	t.Run("Retry-After is limited to the maximum delay", func(t *testing.T) {
+		b := newBackoff()
+		if d := b.throttled(time.Hour); d > throttleMaxDelay {
+			t.Errorf("delay = %v, want at most %v", d, throttleMaxDelay)
+		}
+	})
+
+	t.Run("wait sleeps again when the backoff is extended", func(t *testing.T) {
+		start := now
+		defer func() { now = start }()
+
+		b := newBackoff()
+		var sleeps []time.Duration
+		var extended time.Duration
+		b.sleep = func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			now = now.Add(d)
+			if len(sleeps) == 1 {
+				// Another request is throttled at the end of this sleep.
+				extended = b.throttled(0)
+			}
+
+			return nil
+		}
+
+		first := b.throttled(0)
+		if err := b.wait(t.Context()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sleeps) != 2 || sleeps[0] != first || sleeps[1] != extended {
+			t.Errorf("sleeps = %v, want [%v %v]", sleeps, first, extended)
+		}
+	})
+
 	t.Run("all requests wait during the backoff", func(t *testing.T) {
 		b := newBackoff()
 		var waited time.Duration

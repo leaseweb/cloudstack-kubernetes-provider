@@ -208,20 +208,29 @@ func newThrottleBackoff() *throttleBackoff {
 	}
 }
 
-// wait blocks until the shared backoff ends, or until ctx is done.
+// wait blocks until the shared backoff ends, or until ctx is done. When another request extends the
+// backoff during the sleep, wait sleeps again until the new end.
 func (b *throttleBackoff) wait(ctx context.Context) error {
-	b.mu.Lock()
-	d := b.until.Sub(b.now())
-	b.mu.Unlock()
+	var waited time.Time
+	for {
+		b.mu.Lock()
+		until := b.until
+		d := until.Sub(b.now())
+		b.mu.Unlock()
 
-	if d <= 0 {
-		return nil
+		if d <= 0 || until.Equal(waited) {
+			return nil
+		}
+
+		if err := b.sleep(ctx, d); err != nil {
+			return err
+		}
+		waited = until
 	}
-
-	return b.sleep(ctx, d)
 }
 
-// throttled increases the delay, and starts a shared backoff of at least minDelay. It returns the length of the backoff.
+// throttled increases the delay, and starts a shared backoff of at least minDelay. minDelay is limited to
+// throttleMaxDelay, so a large Retry-After does not stop all requests for a long time. It returns the length of the backoff.
 func (b *throttleBackoff) throttled(minDelay time.Duration) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -234,7 +243,7 @@ func (b *throttleBackoff) throttled(minDelay time.Duration) time.Duration {
 
 	// Add up to 50% jitter, so the requests do not all start again at the same time.
 	d := b.delay + rand.N(b.delay/2+1) //nolint:gosec // Jitter does not need a secure random number.
-	d = max(d, minDelay)
+	d = max(d, min(minDelay, throttleMaxDelay))
 
 	if until := b.now().Add(d); until.After(b.until) {
 		b.until = until
