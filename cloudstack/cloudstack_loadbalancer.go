@@ -126,8 +126,9 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
 	defer func() {
-		if err != nil {
+		if err != nil && !isAPIThrottled(err) {
 			cs.vmCache.invalidate()
 		}
 	}()
@@ -319,8 +320,9 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	klog.V(4).InfoS("UpdateLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 
 	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
 	defer func() {
-		if err != nil {
+		if err != nil && !isAPIThrottled(err) {
 			cs.vmCache.invalidate()
 		}
 	}()

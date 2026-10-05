@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,7 @@ const (
 	throttleMaxRetries = 5
 
 	// throttleInitialDelay and throttleMaxDelay bound the shared backoff after CloudStack rejected a request with HTTP 429.
+	// The jitter and the Retry-After header do not make the backoff longer than throttleMaxDelay.
 	throttleInitialDelay = 1 * time.Second
 	throttleMaxDelay     = 60 * time.Second
 )
@@ -117,6 +119,7 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 			return nil, err
 		}
 
+		epoch := t.backoff.currentEpoch()
 		ctx, cancel := context.WithTimeout(req.Context(), t.attemptTimeout)
 		resp, err := t.next.RoundTrip(attemptReq.WithContext(ctx))
 		if err != nil {
@@ -133,7 +136,7 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 		}
 
 		// Always start the shared backoff, also when this request is not retried.
-		delay := t.backoff.throttled(retryAfter(resp))
+		delay := t.backoff.throttledAt(epoch, retryAfter(resp))
 		if attempt >= t.maxRetries || (req.Body != nil && req.GetBody == nil) {
 			klog.Warningf("CloudStack API throttled the request (HTTP 429), giving up after %d retries", attempt)
 			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
@@ -147,6 +150,12 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 
 		klog.V(2).Infof("CloudStack API throttled the request (HTTP 429), retry %d/%d in %v", attempt+1, t.maxRetries, delay)
 	}
+}
+
+// isAPIThrottled returns whether err is from a request that CloudStack rejected with HTTP 429 after all retries.
+// cloudstack-go returns the error of a rejected request as text only, so the text is checked.
+func isAPIThrottled(err error) bool {
+	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("CloudStack API error %d ", http.StatusTooManyRequests))
 }
 
 // requestForAttempt returns the request to send for the given attempt. The first attempt uses the original
@@ -191,12 +200,16 @@ func (c *cancelOnClose) Close() error {
 }
 
 // throttleBackoff is a backoff that is shared by all requests. When CloudStack rejects a request with
-// HTTP 429, all requests wait, not only the rejected one. The delay increases on each rejection and
-// decreases on each successful request.
+// HTTP 429, all requests wait, not only the rejected one. The delay increases on each rejection of a request
+// that was sent after the last increase, and decreases on each successful request. When the backoff ends,
+// the rate limiter spreads the requests that waited.
 type throttleBackoff struct {
 	mu    sync.Mutex
 	delay time.Duration
 	until time.Time
+	// epoch is incremented each time the delay increases. Requests that were in flight at that time,
+	// and that CloudStack rejected in the same throttle interval, do not increase the delay again.
+	epoch uint64
 	now   func() time.Time
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -229,27 +242,46 @@ func (b *throttleBackoff) wait(ctx context.Context) error {
 	}
 }
 
-// throttled increases the delay, and starts a shared backoff of at least minDelay. minDelay is limited to
-// throttleMaxDelay, so a large Retry-After does not stop all requests for a long time. It returns the length of the backoff.
-func (b *throttleBackoff) throttled(minDelay time.Duration) time.Duration {
+// currentEpoch returns the epoch of the backoff. A request gets it before it is sent, and gives it to throttledAt.
+func (b *throttleBackoff) currentEpoch() uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.delay == 0 {
-		b.delay = throttleInitialDelay
-	} else {
-		b.delay = min(2*b.delay, throttleMaxDelay)
-	}
+	return b.epoch
+}
 
-	// Add up to 50% jitter, so the requests do not all start again at the same time.
-	d := b.delay + rand.N(b.delay/2+1) //nolint:gosec // Jitter does not need a secure random number.
+// throttled is throttledAt for a request that was sent in the current epoch.
+func (b *throttleBackoff) throttled(minDelay time.Duration) time.Duration {
+	return b.throttledAt(b.currentEpoch(), minDelay)
+}
+
+// throttledAt starts a shared backoff of at least minDelay after CloudStack rejected a request that was sent in the
+// given epoch. If no other rejection increased the delay after the request was sent, it increases the delay.
+// The backoff is limited to throttleMaxDelay, so a large Retry-After does not stop all requests for a long time.
+// It returns the time until the backoff ends.
+func (b *throttleBackoff) throttledAt(epoch uint64, minDelay time.Duration) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var d time.Duration
+	if epoch == b.epoch {
+		b.epoch++
+		if b.delay == 0 {
+			b.delay = throttleInitialDelay
+		} else {
+			b.delay = min(2*b.delay, throttleMaxDelay)
+		}
+		// Add up to 50% jitter, so the length of the backoff varies.
+		d = min(b.delay+rand.N(b.delay/2+1), throttleMaxDelay) //nolint:gosec // Jitter does not need a secure random number.
+	}
 	d = max(d, min(minDelay, throttleMaxDelay))
 
-	if until := b.now().Add(d); until.After(b.until) {
+	now := b.now()
+	if until := now.Add(d); until.After(b.until) {
 		b.until = until
 	}
 
-	return d
+	return max(b.until.Sub(now), 0)
 }
 
 // succeeded decreases the delay after a request was not throttled.

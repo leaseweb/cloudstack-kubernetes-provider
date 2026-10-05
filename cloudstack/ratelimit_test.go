@@ -21,6 +21,8 @@ package cloudstack
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -440,5 +442,68 @@ vm-cache-ttl         = 0
 	}
 	if cfg.Global.APIRateLimitQPS != nil || cfg.Global.APIRateLimitBurst != nil || cfg.Global.VMCacheTTL != nil {
 		t.Errorf("unset keys must be nil, got %+v", cfg.Global)
+	}
+}
+
+func TestThrottleBackoffEpoch(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	newBackoff := func() *throttleBackoff {
+		b := newThrottleBackoff()
+		b.now = func() time.Time { return now }
+
+		return b
+	}
+
+	t.Run("concurrent rejections increase the delay once", func(t *testing.T) {
+		b := newBackoff()
+		epoch := b.currentEpoch()
+		first := b.throttledAt(epoch, 0)
+		for range 5 {
+			if d := b.throttledAt(epoch, 0); d != first {
+				t.Errorf("delay = %v, want %v", d, first)
+			}
+		}
+		if b.delay != throttleInitialDelay {
+			t.Errorf("delay = %v, want %v", b.delay, throttleInitialDelay)
+		}
+	})
+
+	t.Run("Retry-After of a concurrent rejection extends the backoff", func(t *testing.T) {
+		b := newBackoff()
+		epoch := b.currentEpoch()
+		b.throttledAt(epoch, 0)
+		if d := b.throttledAt(epoch, 10*time.Second); d != 10*time.Second {
+			t.Errorf("delay = %v, want 10s", d)
+		}
+		if b.delay != throttleInitialDelay {
+			t.Errorf("delay = %v, want %v", b.delay, throttleInitialDelay)
+		}
+	})
+
+	t.Run("jitter does not exceed the maximum delay", func(t *testing.T) {
+		b := newBackoff()
+		for range 20 {
+			if d := b.throttled(0); d > throttleMaxDelay {
+				t.Fatalf("delay = %v, want at most %v", d, throttleMaxDelay)
+			}
+		}
+	})
+}
+
+func TestIsAPIThrottled(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{(&cloudstack.CSError{ErrorCode: http.StatusTooManyRequests, CSErrorCode: 9999, ErrorText: "too many requests"}).Error(), true},
+		{fmt.Errorf("error retrieving list of hosts: %w", (&cloudstack.CSError{ErrorCode: http.StatusTooManyRequests}).Error()), true},
+		{(&cloudstack.CSError{ErrorCode: 431, ErrorText: "unable to find VM"}).Error(), false},
+		{errors.New("connection refused"), false},
+	}
+	for _, tt := range tests {
+		if got := isAPIThrottled(tt.err); got != tt.want {
+			t.Errorf("isAPIThrottled(%v) = %v, want %v", tt.err, got, tt.want)
+		}
 	}
 }
