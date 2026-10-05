@@ -810,6 +810,7 @@ func matchHosts(nodes []*corev1.Node, allVMs []*cloudstack.VirtualMachine) hostM
 	}
 
 	matchedNames := map[string]bool{}
+	matchedVMIDs := map[string]bool{}
 	foundVMIDs := map[string]bool{}
 
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
@@ -835,16 +836,22 @@ func matchHosts(nodes []*corev1.Node, allVMs []*cloudstack.VirtualMachine) hostM
 			m.networkID = vm.Nic[0].Networkid
 			m.hostIDs = append(m.hostIDs, vm.Id)
 			matchedNames[strings.ToLower(vm.Name)] = true
+			matchedVMIDs[vm.Id] = true
 		}
 	}
 
 	m.missingProviderID = len(foundVMIDs) < len(providerVMIDs)
 
+	// A node is matched by its name, or by the VM ID in its ProviderID when the node name differs from the VM name.
 	for _, node := range nodes {
 		shortName, _, _ := strings.Cut(strings.ToLower(node.Name), ".")
-		if !matchedNames[shortName] {
-			m.unmatchedNodes = append(m.unmatchedNodes, node.Name)
+		if matchedNames[shortName] {
+			continue
 		}
+		if id, _, err := instanceIDFromProviderID(node.Spec.ProviderID); err == nil && matchedVMIDs[id] {
+			continue
+		}
+		m.unmatchedNodes = append(m.unmatchedNodes, node.Name)
 	}
 
 	return m

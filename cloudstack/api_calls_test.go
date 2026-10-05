@@ -316,6 +316,20 @@ func TestVerifyHostsVMCache(t *testing.T) {
 		}
 	})
 
+	t.Run("node that matches only by ProviderID uses the cache", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
+		expectVMLists(mockVM, 1, []*cloudstack.VirtualMachine{testVM("vm-1", "vm-name-1")})
+		clock := &fakeClock{now: start}
+		cs := newCachedTestCSCloud(mockVM, clock)
+
+		node := testNode("node-1", "cloudstack:///vm-1", old)
+		verify(t, cs, node)
+		if ids := verify(t, cs, node); !slices.Equal(ids, []string{"vm-1"}) {
+			t.Errorf("ids = %v, want [vm-1]", ids)
+		}
+	})
+
 	t.Run("call after the TTL fetches a new list", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockVM := cloudstack.NewMockVirtualMachineServiceIface(ctrl)
