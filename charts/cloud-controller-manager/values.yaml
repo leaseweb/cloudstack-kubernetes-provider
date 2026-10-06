@@ -122,6 +122,7 @@ cloudConfig:
     # api-rate-limit-qps: 10
     # api-rate-limit-burst: 20
     # vm-cache-ttl: 30
+    # async-job-timeout: 300
 
 # Log verbosity level.
 # See https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md

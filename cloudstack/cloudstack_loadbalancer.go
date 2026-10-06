@@ -89,6 +89,9 @@ type loadBalancer struct {
 	// and the protocol/port pairs of a service are unique, so the changes for one port do not change the rules
 	// that another port uses. A nil map disables this.
 	firewallRules map[string][]*cloudstack.FirewallRule
+
+	// pendingJobs has the assign and remove jobs that are still running. nil disables the tracking.
+	pendingJobs *pendingJobs
 }
 
 // GetLoadBalancer returns whether the specified load balancer exists, and if so, what its status is.
@@ -126,9 +129,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
-	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
+	// Keep it when CloudStack throttled the request or a job is still running, so the retries do not each
+	// fetch the list again.
 	defer func() {
-		if err != nil && !isAPIThrottled(err) {
+		if err != nil && !keepVMCache(err) {
 			cs.vmCache.invalidate()
 		}
 	}()
@@ -211,6 +215,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 	desiredRuleNames, desiredFirewallPorts := desiredRules(lb.name, service)
 
+	// Rules with a CloudStack job that is still running. The other rules are still reconciled, and the service
+	// is retried later.
+	var pendingRules []string
+
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
 		protocol := ProtocolFromServicePort(port, service)
@@ -251,7 +259,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			}
 
 			if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
-				return nil, err
+				if !errors.Is(err, errJobPending) {
+					return nil, err
+				}
+				pendingRules = append(pendingRules, err.Error())
 			}
 
 			// Delete the rule from the map, to prevent it being deleted.
@@ -265,7 +276,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 			klog.V(4).Infof("Assigning hosts (%v) to load balancer rule: %v", lb.hostIDs, lbRuleName)
 			if err = lb.assignHostsToRule(lbRule, lb.hostIDs); err != nil {
-				return nil, err
+				if !errors.Is(err, errJobPending) {
+					return nil, err
+				}
+				pendingRules = append(pendingRules, err.Error())
 			}
 		}
 
@@ -326,6 +340,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 	}
 
+	if err := pendingJobsError(pendingRules); err != nil {
+		return nil, err
+	}
+
 	return lb.generateLoadBalancerStatus(service), nil
 }
 
@@ -334,9 +352,10 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	klog.V(4).InfoS("UpdateLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
 
 	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
-	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
+	// Keep it when CloudStack throttled the request or a job is still running, so the retries do not each
+	// fetch the list again.
 	defer func() {
-		if err != nil && !isAPIThrottled(err) {
+		if err != nil && !keepVMCache(err) {
 			cs.vmCache.invalidate()
 		}
 	}()
@@ -355,13 +374,19 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 		return err
 	}
 
+	// Rules with a CloudStack job that is still running. The other rules are still reconciled, and the service
+	// is retried later.
+	var pendingRules []string
 	for _, lbRule := range lb.rules {
 		if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
-			return err
+			if !errors.Is(err, errJobPending) {
+				return err
+			}
+			pendingRules = append(pendingRules, err.Error())
 		}
 	}
 
-	return nil
+	return pendingJobsError(pendingRules)
 }
 
 // isFirewallSupported checks whether a CloudStack network supports the Firewall service.
@@ -637,6 +662,7 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service, name, legacyName str
 func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer, error) {
 	lb := &loadBalancer{
 		CloudStackClient: cs.client,
+		pendingJobs:      cs.pendingJobs,
 		name:             name,
 		projectID:        cs.projectID,
 		rules:            make(map[string]*cloudstack.LoadBalancerRule),
@@ -698,6 +724,7 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadBalancer, error) {
 	lb := &loadBalancer{
 		CloudStackClient: cs.client,
+		pendingJobs:      cs.pendingJobs,
 		name:             name,
 		projectID:        cs.projectID,
 		rules:            make(map[string]*cloudstack.LoadBalancerRule),
@@ -1254,7 +1281,14 @@ func (lb *loadBalancer) deleteLoadBalancerRule(lbRule *cloudstack.LoadBalancerRu
 // reconcileHostsForRule ensures the load balancer rule has exactly the expected set of hosts.
 // It lists the current members, computes the difference, and assigns new hosts before removing
 // old ones so the rule always has backends during rolling upgrades.
+//
+// If an earlier assign or remove job for the rule is still running, it returns an error that wraps errJobPending
+// and changes nothing, so the same job is not sent again.
 func (lb *loadBalancer) reconcileHostsForRule(lbRule *cloudstack.LoadBalancerRule, hostIDs []string) error {
+	if err := lb.checkPendingJob(lbRule); err != nil {
+		return err
+	}
+
 	p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
 
 	l, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
@@ -1289,11 +1323,24 @@ func (lb *loadBalancer) assignHostsToRule(lbRule *cloudstack.LoadBalancerRule, h
 	p := lb.LoadBalancer.NewAssignToLoadBalancerRuleParams(lbRule.Id)
 	p.SetVirtualmachineids(hostIDs)
 
-	if _, err := lb.LoadBalancer.AssignToLoadBalancerRule(p); err != nil {
+	if r, err := lb.LoadBalancer.AssignToLoadBalancerRule(p); err != nil {
+		if perr := lb.trackTimedOutJob(lbRule, "assign", jobIDOf(r), hostIDs, err); perr != nil {
+			return perr
+		}
+
 		return fmt.Errorf("error assigning hosts to load balancer rule %v: %w", lbRule.Name, err)
 	}
 
 	return nil
+}
+
+// jobIDOf returns the job ID of an assign response, or "" if there is none.
+func jobIDOf(r *cloudstack.AssignToLoadBalancerRuleResponse) string {
+	if r == nil {
+		return ""
+	}
+
+	return r.JobID
 }
 
 // removeHostsFromRule removes hosts from a load balancer rule.
@@ -1301,7 +1348,15 @@ func (lb *loadBalancer) removeHostsFromRule(lbRule *cloudstack.LoadBalancerRule,
 	p := lb.LoadBalancer.NewRemoveFromLoadBalancerRuleParams(lbRule.Id)
 	p.SetVirtualmachineids(hostIDs)
 
-	if _, err := lb.LoadBalancer.RemoveFromLoadBalancerRule(p); err != nil {
+	if r, err := lb.LoadBalancer.RemoveFromLoadBalancerRule(p); err != nil {
+		jobID := ""
+		if r != nil {
+			jobID = r.JobID
+		}
+		if perr := lb.trackTimedOutJob(lbRule, "remove", jobID, hostIDs, err); perr != nil {
+			return perr
+		}
+
 		return fmt.Errorf("error removing hosts from load balancer rule %v: %w", lbRule.Name, err)
 	}
 

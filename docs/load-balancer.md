@@ -76,3 +76,47 @@ Live IP reassignment is not supported. To change the IP address of a load balanc
 
 1. Delete the existing service
 2. Create a new service with the desired IP in the `cloudstack-load-balancer-address` annotation
+
+## Large clusters and node rollouts
+
+### How CloudStack applies load balancer changes
+
+All load balancer rules of a network run on the virtual router (VR) of that network. Each change to a rule, such as assigning a VM or removing a VM, makes CloudStack send the **complete** load balancer configuration of the network to the VR again. The VR runs these commands one at a time.
+
+When a node joins or leaves the cluster, every rule changes: one assign or remove per rule, so about one VR command per rule. CloudStack itself also changes every rule when a VM is destroyed: it removes the VM from each rule, one rule at a time. On a network with many rules, a single node replacement can therefore keep the VR busy for a long time. As a rough estimate, count the number of rules × 15–20 seconds, once for the new node and once for the old node.
+
+If node replacements come faster than the VR can process them, the commands queue up. Async jobs then take minutes or hours, VM destroys stay in `Expunging`, and new nodes are added to the rules late.
+
+### Jobs that are still running
+
+When an assign or remove job takes longer than `async-job-timeout`, CloudStack still runs it. The CCM keeps the job ID and does not send the same job again. On the next reconcile, it checks the job, and it only changes the rule again when the job has finished. Until then it logs:
+
+```
+error processing service <namespace>/<name> (retrying in 1m0s): … waiting for CloudStack jobs: assign job <job-id> for load balancer rule <rule>: CloudStack job is still running
+```
+
+This is expected while the VR is busy. The other rules of the service are still reconciled.
+
+### Use a stable set of load balancer nodes
+
+The most effective way to keep node rollouts away from the VR is to keep the nodes that are rolled often out of the load balancer rules. Label them with `node.kubernetes.io/exclude-from-external-load-balancers`, and keep a small, stable set of nodes as load balancer backends:
+
+```sh
+kubectl label node <node> node.kubernetes.io/exclude-from-external-load-balancers=true
+```
+
+- Use at least 2–3 backend nodes on different hosts, so one node failure does not take the load balancers down.
+- With `externalTrafficPolicy: Cluster` (the default), the backend nodes forward traffic to pods on all nodes, so pods can still run anywhere.
+- With `externalTrafficPolicy: Local`, traffic only reaches pods on the backend nodes. Make sure the pods of those services run there.
+- Roll the backend nodes separately, one node at a time, and wait until the CCM has updated all load balancers before the next one.
+- If nodes are created by a tool such as Cluster API, set the label in the node template, so new nodes get it before they join the load balancers.
+
+Then a rollout of the other nodes changes no load balancer rules at all.
+
+### Pace node rollouts
+
+If all nodes are load balancer backends:
+
+- Replace one node only after the previous VM destroy has finished and the CCM logged `Successfully updated N out of N load balancers to direct traffic to the updated set of nodes`.
+- Replace several nodes per step (a larger `maxSurge` / `maxUnavailable`) instead of one node at a time. One assign per rule can add several new nodes, so this needs fewer VR commands per node.
+

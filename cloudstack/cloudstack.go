@@ -54,6 +54,8 @@ type CSConfig struct {
 		// VMCacheTTL is the number of seconds that the list of virtual machines is cached for load balancer
 		// host lookups. 0 disables the cache.
 		VMCacheTTL *int `gcfg:"vm-cache-ttl"`
+		// AsyncJobTimeout is the number of seconds that the CCM waits for a CloudStack async job.
+		AsyncJobTimeout *int `gcfg:"async-job-timeout"`
 	}
 }
 
@@ -70,7 +72,8 @@ type CSCloud struct {
 	zone          string
 	kclient       kubernetes.Interface
 	eventRecorder record.EventRecorder
-	vmCache       *vmCache // nil disables the cache
+	vmCache       *vmCache     // nil disables the cache
+	pendingJobs   *pendingJobs // nil disables the tracking of running jobs
 }
 
 func init() {
@@ -124,15 +127,25 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 		vmCacheTTL = time.Duration(*cfg.Global.VMCacheTTL) * time.Second
 	}
 
+	asyncJobTimeout := defaultAsyncJobTimeout
+	if cfg.Global.AsyncJobTimeout != nil {
+		if *cfg.Global.AsyncJobTimeout <= 0 {
+			return nil, fmt.Errorf("invalid cloud provider configuration: async-job-timeout must be at least 1, got %d", *cfg.Global.AsyncJobTimeout)
+		}
+		asyncJobTimeout = time.Duration(*cfg.Global.AsyncJobTimeout) * time.Second
+	}
+
 	cs := &CSCloud{
-		projectID: cfg.Global.ProjectID,
-		zone:      cfg.Global.Zone,
-		vmCache:   newVMCache(vmCacheTTL),
+		projectID:   cfg.Global.ProjectID,
+		zone:        cfg.Global.Zone,
+		vmCache:     newVMCache(vmCacheTTL),
+		pendingJobs: newPendingJobs(),
 	}
 
 	if cfg.Global.APIURL != "" && cfg.Global.APIKey != "" && cfg.Global.SecretKey != "" {
 		cs.client = cloudstack.NewAsyncClient(cfg.Global.APIURL, cfg.Global.APIKey, cfg.Global.SecretKey, !cfg.Global.SSLNoVerify,
-			cloudstack.WithHTTPClient(newHTTPClient(cfg.Global.SSLNoVerify, qps, burst)))
+			cloudstack.WithHTTPClient(newHTTPClient(cfg.Global.SSLNoVerify, qps, burst)),
+			cloudstack.WithAsyncTimeout(int64(asyncJobTimeout/time.Second)))
 	}
 
 	if cs.client == nil {
@@ -150,6 +163,8 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 	} else {
 		klog.Info("CloudStack VM cache for load balancer host lookups is disabled")
 	}
+
+	klog.Infof("CloudStack async job timeout: %v", asyncJobTimeout)
 
 	return cs, nil
 }

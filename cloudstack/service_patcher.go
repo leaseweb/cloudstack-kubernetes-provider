@@ -55,6 +55,10 @@ func (sp *servicePatcher) Patch(ctx context.Context, err error) error {
 		return err
 	}
 	perr := patchService(ctx, sp.kclient, sp.base, sp.updated)
+	if perr == nil {
+		// Return err as it is, so callers can still find a wrapped error such as a RetryError with errors.As.
+		return err
+	}
 
 	return utilerrors.NewAggregate([]error{err, perr})
 }
