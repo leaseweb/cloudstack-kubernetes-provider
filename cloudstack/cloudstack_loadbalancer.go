@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	corev1 "k8s.io/api/core/v1"
@@ -82,6 +83,12 @@ type loadBalancer struct {
 	networkID string
 	projectID string
 	rules     map[string]*cloudstack.LoadBalancerRule
+
+	// firewallRules has the firewall rules of each public IP ID that updateFirewallRule fetched, so the ports
+	// of a service share one listFirewallRules call. Each port only uses the rules for its own protocol and port,
+	// and the protocol/port pairs of a service are unique, so the changes for one port do not change the rules
+	// that another port uses. A nil map disables this.
+	firewallRules map[string][]*cloudstack.FirewallRule
 }
 
 // GetLoadBalancer returns whether the specified load balancer exists, and if so, what its status is.
@@ -117,6 +124,14 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	if len(service.Spec.Ports) == 0 {
 		return nil, errors.New("requested load balancer with no ports")
 	}
+
+	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
+	defer func() {
+		if err != nil && !isAPIThrottled(err) {
+			cs.vmCache.invalidate()
+		}
+	}()
 
 	// Patch the service with new/updated annotations if needed after EnsureLoadBalancer finishes.
 	patcher := newServicePatcher(cs.kclient, service)
@@ -188,6 +203,12 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	setServiceAnnotation(service, ServiceAnnotationLoadBalancerID, lb.ipAddrID)
 	setServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID, lb.networkID)
 
+	// These lookups give the same result for each port, so they are done at the first port and reused for the
+	// other ports. This reduces the number of API calls but keeps the order of the calls for the first port.
+	var network *cloudstack.Network
+	var lbSourceRanges utilnet.IPNetSet
+	lb.firewallRules = map[string][]*cloudstack.FirewallRule{}
+
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
 		protocol := ProtocolFromServicePort(port, service)
@@ -199,9 +220,16 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
 
 		// If the load balancer rule exists and is up-to-date, we move on to the next rule.
+		_, ruleExisted := lb.rules[lbRuleName]
 		lbRule, needsUpdate, err := lb.checkLoadBalancerRule(lbRuleName, port, protocol)
 		if err != nil {
 			return nil, err
+		}
+
+		if ruleExisted && lbRule == nil {
+			// checkLoadBalancerRule deleted the load balancer rule. Fetch the firewall rules again in
+			// case CloudStack also changed them.
+			clear(lb.firewallRules)
 		}
 
 		if lbRule != nil { //nolint:nestif
@@ -233,18 +261,21 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			}
 		}
 
-		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
-		if err != nil {
-			if count == 0 {
-				return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
+		if network == nil {
+			var count int
+			network, count, err = lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
+			if err != nil {
+				if count == 0 {
+					return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
+				}
+
+				return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
 			}
 
-			return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
-		}
-
-		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
-		if err != nil {
-			return nil, err
+			lbSourceRanges, err = getLoadBalancerSourceRanges(service)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if lbRule != nil && isFirewallSupported(network.Service) {
@@ -285,8 +316,16 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 }
 
 // UpdateLoadBalancer updates hosts under the specified load balancer.
-func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) error {
+func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (err error) {
 	klog.V(4).InfoS("UpdateLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
+
+	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request, so the retries do not each fetch the list again.
+	defer func() {
+		if err != nil && !isAPIThrottled(err) {
+			cs.vmCache.invalidate()
+		}
+	}()
 
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
@@ -689,7 +728,70 @@ func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadB
 // During rolling upgrades some nodes may not yet have a corresponding VM in CloudStack, so we tolerate
 // partial matches: as long as at least one node can be resolved we return the matched set and log
 // warnings for the nodes we could not find.
+//
+// The list of VMs can come from the VM cache. If the cached list does not give a complete match, or a node
+// is newer than the cached list, a new list is fetched and the match is done again. So the result is the
+// same as with a new list, unless VMs that match a node were changed or deleted within the cache TTL.
 func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
+	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
+	list, err := cs.vmCache.get(cs.listAllVirtualMachines, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
+	}
+
+	m := matchHosts(nodes, list.vms)
+	if !list.fresh && m.needsFreshList(nodes, list.fetchedAt) {
+		klog.V(4).Infof("Cached list of VMs does not match all %d node(s), fetching a new list", len(nodes))
+		list, err = cs.vmCache.get(cs.listAllVirtualMachines, &list)
+		if err != nil {
+			return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
+		}
+		m = matchHosts(nodes, list.vms)
+	}
+
+	for i, name := range m.skippedNoNIC {
+		klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", name, m.skippedNoNICIDs[i])
+	}
+
+	if m.err != nil {
+		return nil, "", m.err
+	}
+
+	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
+	if len(m.unmatchedNodes) > 0 {
+		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(m.unmatchedNodes), m.unmatchedNodes)
+	}
+	if len(m.skippedNoNIC) > 0 {
+		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(m.skippedNoNIC), m.skippedNoNIC)
+	}
+
+	if len(m.hostIDs) == 0 || len(m.networkID) == 0 {
+		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
+			len(nodes), m.unmatchedNodes, m.skippedNoNIC)
+	}
+
+	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(m.hostIDs), len(nodes))
+
+	return m.hostIDs, m.networkID, nil
+}
+
+// hostMatch is the result of matching nodes to VMs.
+type hostMatch struct {
+	hostIDs        []string
+	networkID      string
+	unmatchedNodes []string
+	skippedNoNIC   []string
+	// skippedNoNICIDs has the IDs of the VMs in skippedNoNIC, in the same order.
+	skippedNoNICIDs []string
+	// missingProviderID is true if the VM ID in the ProviderID of a node is not in the list of VMs.
+	missingProviderID bool
+	err               error
+}
+
+// matchHosts matches the nodes to the VMs by name and by the VM ID in the ProviderID of the node.
+func matchHosts(nodes []*corev1.Node, allVMs []*cloudstack.VirtualMachine) hostMatch {
+	var m hostMatch
+
 	hostNames := map[string]bool{}
 	// providerVMIDs maps CloudStack VM IDs extracted from node.Spec.ProviderID
 	// so we can match by ID in addition to name.
@@ -707,61 +809,71 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 		}
 	}
 
-	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
-	allVMs, err := cs.listAllVirtualMachines()
-	if err != nil {
-		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
-	}
-
-	var hostIDs []string
-	var networkID string
 	matchedNames := map[string]bool{}
-	var skippedNoNIC []string
+	matchedVMIDs := map[string]bool{}
+	foundVMIDs := map[string]bool{}
 
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
 	for _, vm := range allVMs {
 		nameMatch := hostNames[strings.ToLower(vm.Name)]
 		idMatch := providerVMIDs[vm.Id]
+		if idMatch {
+			foundVMIDs[vm.Id] = true
+		}
 		if nameMatch || idMatch {
 			if len(vm.Nic) == 0 {
-				klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", vm.Name, vm.Id)
-				skippedNoNIC = append(skippedNoNIC, vm.Name)
+				m.skippedNoNIC = append(m.skippedNoNIC, vm.Name)
+				m.skippedNoNICIDs = append(m.skippedNoNICIDs, vm.Id)
 				// Skip VM's without any active network interfaces. This happens during rollout f.e.
 				continue
 			}
-			if networkID != "" && networkID != vm.Nic[0].Networkid {
-				return nil, "", errors.New("found hosts that belong to different networks")
+			if m.networkID != "" && m.networkID != vm.Nic[0].Networkid {
+				m.err = errors.New("found hosts that belong to different networks")
+
+				return m
 			}
 
-			networkID = vm.Nic[0].Networkid
-			hostIDs = append(hostIDs, vm.Id)
+			m.networkID = vm.Nic[0].Networkid
+			m.hostIDs = append(m.hostIDs, vm.Id)
 			matchedNames[strings.ToLower(vm.Name)] = true
+			matchedVMIDs[vm.Id] = true
 		}
 	}
 
-	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
-	var unmatchedNodes []string
+	m.missingProviderID = len(foundVMIDs) < len(providerVMIDs)
+
+	// A node is matched by its name, or by the VM ID in its ProviderID when the node name differs from the VM name.
 	for _, node := range nodes {
 		shortName, _, _ := strings.Cut(strings.ToLower(node.Name), ".")
-		if !matchedNames[shortName] {
-			unmatchedNodes = append(unmatchedNodes, node.Name)
+		if matchedNames[shortName] {
+			continue
+		}
+		if id, _, err := instanceIDFromProviderID(node.Spec.ProviderID); err == nil && matchedVMIDs[id] {
+			continue
+		}
+		m.unmatchedNodes = append(m.unmatchedNodes, node.Name)
+	}
+
+	return m
+}
+
+// needsFreshList returns true if a match on a cached list of VMs (fetched at fetchedAt) may differ from a match
+// on a new list.
+func (m hostMatch) needsFreshList(nodes []*corev1.Node, fetchedAt time.Time) bool {
+	if m.err != nil || m.missingProviderID || len(m.unmatchedNodes) > 0 || len(m.skippedNoNIC) > 0 {
+		return true
+	}
+
+	// The API server stores the creation time of a node in whole seconds. A node that was created in the same
+	// second as the fetch may be newer than the list, so it also needs a new list.
+	fetchedAtSecond := fetchedAt.Truncate(time.Second)
+	for _, node := range nodes {
+		if !node.CreationTimestamp.Time.Before(fetchedAtSecond) {
+			return true
 		}
 	}
-	if len(unmatchedNodes) > 0 {
-		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(unmatchedNodes), unmatchedNodes)
-	}
-	if len(skippedNoNIC) > 0 {
-		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(skippedNoNIC), skippedNoNIC)
-	}
 
-	if len(hostIDs) == 0 || len(networkID) == 0 {
-		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
-			len(nodes), unmatchedNodes, skippedNoNIC)
-	}
-
-	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(hostIDs), len(nodes))
-
-	return hostIDs, networkID, nil
+	return false
 }
 
 // listAllVirtualMachines retrieves all VMs using pagination to handle large projects.
@@ -1225,11 +1337,22 @@ func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
 //
 // Returns true if the firewall rule was created or updated.
 func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
-	// Default to allow-all if no allowed CIDRs are defined.
-	if len(allowedCIDRs) == 0 {
-		allowedCIDRs = []string{defaultAllowedCIDR}
+	rules, ok := lb.firewallRules[publicIPID]
+	if !ok {
+		var err error
+		if rules, err = lb.listFirewallRules(publicIPID); err != nil {
+			return false, err
+		}
+		if lb.firewallRules != nil {
+			lb.firewallRules[publicIPID] = rules
+		}
 	}
 
+	return lb.reconcileFirewallRule(rules, publicIPID, publicPort, protocol, allowedCIDRs)
+}
+
+// listFirewallRules returns the firewall rules of a public IP.
+func (lb *loadBalancer) listFirewallRules(publicIPID string) ([]*cloudstack.FirewallRule, error) {
 	p := lb.Firewall.NewListFirewallRulesParams()
 	p.SetIpaddressid(publicIPID)
 	p.SetListall(true)
@@ -1238,14 +1361,29 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	}
 	r, err := lb.Firewall.ListFirewallRules(p)
 	if err != nil {
-		return false, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
+		return nil, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
 	}
 	klog.V(4).Infof("Existing firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
+
+	return r.FirewallRules, nil
+}
+
+// reconcileFirewallRule creates or updates the firewall rule for a protocol and port, using the given existing
+// firewall rules of the public IP.
+//
+// Returns true if the firewall rule was created or updated.
+func (lb *loadBalancer) reconcileFirewallRule(existing []*cloudstack.FirewallRule, publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
+	var err error
+
+	// Default to allow-all if no allowed CIDRs are defined.
+	if len(allowedCIDRs) == 0 {
+		allowedCIDRs = []string{defaultAllowedCIDR}
+	}
 
 	// find all rules that have a matching proto+port
 	// a map may or may not be faster, but is a bit easier to understand
 	filtered := make(map[*cloudstack.FirewallRule]bool)
-	for _, rule := range r.FirewallRules {
+	for _, rule := range existing {
 		if rule.Protocol == protocol.IPProtocol() && rule.Startport == publicPort && rule.Endport == publicPort {
 			filtered[rule] = true
 		}
