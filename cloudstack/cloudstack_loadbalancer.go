@@ -749,6 +749,10 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 		m = matchHosts(nodes, list.vms)
 	}
 
+	if !list.fresh {
+		klog.V(4).Infof("Using cached list of %d VM(s), fetched %v ago", len(list.vms), time.Since(list.fetchedAt).Round(time.Millisecond))
+	}
+
 	for i, name := range m.skippedNoNIC {
 		klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", name, m.skippedNoNICIDs[i])
 	}

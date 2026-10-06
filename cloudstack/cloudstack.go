@@ -145,6 +145,12 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 		klog.Info("CloudStack API rate limit is disabled")
 	}
 
+	if vmCacheTTL > 0 {
+		klog.Infof("CloudStack VM cache for load balancer host lookups: TTL %v", vmCacheTTL)
+	} else {
+		klog.Info("CloudStack VM cache for load balancer host lookups is disabled")
+	}
+
 	return cs, nil
 }
 
