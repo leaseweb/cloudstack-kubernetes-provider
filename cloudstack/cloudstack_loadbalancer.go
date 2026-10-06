@@ -209,6 +209,8 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	var lbSourceRanges utilnet.IPNetSet
 	lb.firewallRules = map[string][]*cloudstack.FirewallRule{}
 
+	desiredRuleNames, desiredFirewallPorts := desiredRules(lb.name, service)
+
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
 		protocol := ProtocolFromServicePort(port, service)
@@ -217,7 +219,13 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		// All ports have their own load balancer rule, so add the port to lbName to keep the names unique.
-		lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
+		lbRuleName := loadBalancerRuleName(lb.name, protocol, port.Port)
+
+		// If the protocol of the port changed between tcp and tcp-proxy, the rule name changed too. CloudStack does
+		// not allow a second rule on the same public port, so switch the existing rule instead of creating one.
+		if err := cs.switchLoadBalancerRule(lb, service, lbRuleName, port, protocol, desiredRuleNames); err != nil {
+			return nil, err
+		}
 
 		// If the load balancer rule exists and is up-to-date, we move on to the next rule.
 		_, ruleExisted := lb.rules[lbRuleName]
@@ -301,9 +309,15 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, fmt.Errorf("error parsing port %s: %w", lbRule.Publicport, err)
 		}
 
-		klog.V(4).Infof("Deleting firewall rules associated with load balancer rule: %v (%v:%v:%v)", lbRule.Name, protocol, lbRule.Publicip, port)
-		if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
-			return nil, err
+		// Keep the firewall rules if a port of the service still uses the same protocol and port, for example when
+		// both a tcp and a tcp-proxy rule exist for the same port.
+		if desiredFirewallPorts[firewallPortKey(protocol, int(port))] {
+			klog.V(4).Infof("Keeping firewall rules of load balancer rule %v, because %v/%v is still in use", lbRule.Name, protocol.IPProtocol(), port)
+		} else {
+			klog.V(4).Infof("Deleting firewall rules associated with load balancer rule: %v (%v:%v:%v)", lbRule.Name, protocol, lbRule.Publicip, port)
+			if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
+				return nil, err
+			}
 		}
 
 		klog.V(4).Infof("Deleting obsolete load balancer rule: %v", lbRule.Name)
@@ -1040,6 +1054,106 @@ func (lb *loadBalancer) releaseLoadBalancerIP() error {
 	if _, err := lb.Address.DisassociateIpAddress(p); err != nil {
 		return fmt.Errorf("error releasing load balancer IP %v: %w", lb.ipAddr, err)
 	}
+
+	return nil
+}
+
+// loadBalancerRuleName returns the name of the load balancer rule for a protocol and port.
+func loadBalancerRuleName(lbName string, protocol LoadBalancerProtocol, port int32) string {
+	return fmt.Sprintf("%s-%s-%d", lbName, protocol, port)
+}
+
+// firewallPortKey returns the key of the firewall rules for a protocol and port. The tcp and tcp-proxy
+// protocols have the same key, because they use the same firewall rules.
+func firewallPortKey(protocol LoadBalancerProtocol, port int) string {
+	return fmt.Sprintf("%s/%d", protocol.IPProtocol(), port)
+}
+
+// desiredRules returns the names of the load balancer rules and the firewall keys (see firewallPortKey) for the
+// ports of the service. Ports with an invalid protocol are skipped; EnsureLoadBalancer returns an error for them.
+func desiredRules(lbName string, service *corev1.Service) (map[string]bool, map[string]bool) {
+	ruleNames := map[string]bool{}
+	firewallPorts := map[string]bool{}
+	for _, port := range service.Spec.Ports {
+		protocol := ProtocolFromServicePort(port, service)
+		if protocol == LoadBalancerProtocolInvalid {
+			continue
+		}
+		ruleNames[loadBalancerRuleName(lbName, protocol, port.Port)] = true
+		firewallPorts[firewallPortKey(protocol, int(port.Port))] = true
+	}
+
+	return ruleNames, firewallPorts
+}
+
+// findRuleForPort returns an existing load balancer rule for the same public IP, public port and IP protocol as
+// the port, but with another name. This is the rule of the port before its protocol changed between tcp and
+// tcp-proxy. Rules that another port of the service uses (desired) are not returned.
+func (lb *loadBalancer) findRuleForPort(lbRuleName string, port corev1.ServicePort, protocol LoadBalancerProtocol, desired map[string]bool) *cloudstack.LoadBalancerRule {
+	for name, rule := range lb.rules {
+		if name == lbRuleName || desired[name] {
+			continue
+		}
+		if rule.Publicip == lb.ipAddr && rule.Publicport == strconv.Itoa(int(port.Port)) &&
+			ProtocolFromLoadBalancer(rule.Protocol).IPProtocol() == protocol.IPProtocol() {
+			return rule
+		}
+	}
+
+	return nil
+}
+
+// switchLoadBalancerRule switches the existing rule of a port to the new rule name and protocol, if the protocol
+// of the port changed between tcp and tcp-proxy. If the node port is the same, the rule is updated in place, so its
+// hosts and firewall rules stay. Else the old rule is deleted, so the new rule can be created. The firewall rules
+// of the port are kept in both cases.
+func (cs *CSCloud) switchLoadBalancerRule(lb *loadBalancer, service *corev1.Service, lbRuleName string, port corev1.ServicePort, protocol LoadBalancerProtocol, desired map[string]bool) error {
+	if _, ok := lb.rules[lbRuleName]; ok {
+		return nil
+	}
+
+	old := lb.findRuleForPort(lbRuleName, port, protocol, desired)
+	if old == nil {
+		return nil
+	}
+
+	// The firewall rules are not changed, but fetch them again in case CloudStack changed them.
+	defer clear(lb.firewallRules)
+
+	if old.Privateport != strconv.Itoa(int(port.NodePort)) {
+		klog.Infof("Deleting load balancer rule %v, because it is replaced by %v with another node port", old.Name, lbRuleName)
+
+		return lb.deleteLoadBalancerRule(old)
+	}
+
+	if err := lb.renameLoadBalancerRule(old, lbRuleName, protocol); err != nil {
+		return err
+	}
+
+	msg := fmt.Sprintf("Updated load balancer rule %s to %s with protocol %s", old.Name, lbRuleName, protocol.CSProtocol())
+	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "UpdatedLoadBalancerRule", msg)
+	klog.Info(msg)
+
+	return nil
+}
+
+// renameLoadBalancerRule updates the name, protocol and algorithm of an existing load balancer rule.
+func (lb *loadBalancer) renameLoadBalancerRule(old *cloudstack.LoadBalancerRule, lbRuleName string, protocol LoadBalancerProtocol) error {
+	p := lb.LoadBalancer.NewUpdateLoadBalancerRuleParams(old.Id)
+	p.SetName(lbRuleName)
+	p.SetAlgorithm(lb.algorithm)
+	p.SetProtocol(protocol.CSProtocol())
+
+	if _, err := lb.LoadBalancer.UpdateLoadBalancerRule(p); err != nil {
+		return fmt.Errorf("failed to update load balancer rule %v to %v: %w", old.Name, lbRuleName, err)
+	}
+
+	renamed := *old
+	renamed.Name = lbRuleName
+	renamed.Algorithm = lb.algorithm
+	renamed.Protocol = protocol.CSProtocol()
+	delete(lb.rules, old.Name)
+	lb.rules[lbRuleName] = &renamed
 
 	return nil
 }
