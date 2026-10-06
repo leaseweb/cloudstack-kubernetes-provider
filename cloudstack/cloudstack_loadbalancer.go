@@ -1274,6 +1274,7 @@ func (lb *loadBalancer) deleteLoadBalancerRule(lbRule *cloudstack.LoadBalancerRu
 
 	// Delete the rule from the map as it no longer exists
 	delete(lb.rules, lbRule.Name)
+	lb.pendingJobs.delete(lbRule.Id)
 
 	return nil
 }
@@ -1288,6 +1289,13 @@ func (lb *loadBalancer) reconcileHostsForRule(lbRule *cloudstack.LoadBalancerRul
 	if err := lb.checkPendingJob(lbRule); err != nil {
 		return err
 	}
+
+	// The node sync and the service sync can reconcile the same service at the same time. Only one of them
+	// changes a rule, so the other one does not send the same job.
+	if !lb.pendingJobs.claim(lbRule.Id) {
+		return fmt.Errorf("load balancer rule %v is being changed by another reconcile: %w", lbRule.Name, errJobPending)
+	}
+	defer lb.pendingJobs.release(lbRule.Id)
 
 	p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
 
@@ -1324,7 +1332,11 @@ func (lb *loadBalancer) assignHostsToRule(lbRule *cloudstack.LoadBalancerRule, h
 	p.SetVirtualmachineids(hostIDs)
 
 	if r, err := lb.LoadBalancer.AssignToLoadBalancerRule(p); err != nil {
-		if perr := lb.trackTimedOutJob(lbRule, "assign", jobIDOf(r), hostIDs, err); perr != nil {
+		var jobID string
+		if r != nil {
+			jobID = r.JobID
+		}
+		if perr := lb.trackTimedOutJob(lbRule, "assign", jobID, hostIDs, err); perr != nil {
 			return perr
 		}
 
@@ -1334,22 +1346,13 @@ func (lb *loadBalancer) assignHostsToRule(lbRule *cloudstack.LoadBalancerRule, h
 	return nil
 }
 
-// jobIDOf returns the job ID of an assign response, or "" if there is none.
-func jobIDOf(r *cloudstack.AssignToLoadBalancerRuleResponse) string {
-	if r == nil {
-		return ""
-	}
-
-	return r.JobID
-}
-
 // removeHostsFromRule removes hosts from a load balancer rule.
 func (lb *loadBalancer) removeHostsFromRule(lbRule *cloudstack.LoadBalancerRule, hostIDs []string) error {
 	p := lb.LoadBalancer.NewRemoveFromLoadBalancerRuleParams(lbRule.Id)
 	p.SetVirtualmachineids(hostIDs)
 
 	if r, err := lb.LoadBalancer.RemoveFromLoadBalancerRule(p); err != nil {
-		jobID := ""
+		var jobID string
 		if r != nil {
 			jobID = r.JobID
 		}

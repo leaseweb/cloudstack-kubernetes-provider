@@ -190,6 +190,64 @@ func TestPendingAssignJobs(t *testing.T) {
 		}
 	})
 
+	t.Run("other 431 error of the job query keeps the job", func(t *testing.T) {
+		m := newPendingJobTestMocks(t)
+		service := proxyService(false, tcp80)
+		cs := m.newTrackingCSCloud(service)
+		cs.pendingJobs.set("id-tcp-80", pendingJob{jobID: testJobID, op: "assign", submitted: time.Now()})
+
+		m.expectExistingRules(testLBRule("tcp-80", "30080", "80"))
+		m.expectJobStatus(0, errors.New("CloudStack API error 431 (CSExceptionErrorCode: 9999): Invalid parameter projectid"))
+
+		if _, err := cs.EnsureLoadBalancer(t.Context(), "cluster", service, proxyNodes); err == nil || isRetryError(err) {
+			t.Fatalf("err = %v, want the job query error", err)
+		}
+		if _, ok := cs.pendingJobs.get("id-tcp-80"); !ok {
+			t.Error("the job is not tracked anymore")
+		}
+	})
+
+	t.Run("rule claimed by another reconcile is skipped", func(t *testing.T) {
+		m := newPendingJobTestMocks(t)
+		service := proxyService(false, tcp80)
+		cs := m.newTrackingCSCloud(service)
+		if !cs.pendingJobs.claim("id-tcp-80") {
+			t.Fatal("claim failed")
+		}
+
+		// No job query, no list and no assign for the claimed rule.
+		m.expectExistingRules(testLBRule("tcp-80", "30080", "80"))
+		expectNetworkWithFirewall(m.network)
+		m.expectFirewallLists(1, fwTCP80)
+
+		_, err := cs.EnsureLoadBalancer(t.Context(), "cluster", service, proxyNodes)
+		if !isRetryError(err) || !strings.Contains(err.Error(), "being changed by another reconcile") {
+			t.Fatalf("err = %v, want a RetryError for the claimed rule", err)
+		}
+		if cs.pendingJobs.claim("id-tcp-80") {
+			t.Error("the claim of the other reconcile was released")
+		}
+	})
+
+	t.Run("claim is released after a reconcile", func(t *testing.T) {
+		m := newPendingJobTestMocks(t)
+		service := proxyService(false, tcp80)
+		cs := m.newTrackingCSCloud(service)
+
+		m.expectExistingRules(testLBRule("tcp-80", "30080", "80"))
+		m.expectInstances("id-tcp-80")
+		m.expectAssign("id-tcp-80", "job-2", nil)
+		expectNetworkWithFirewall(m.network)
+		m.expectFirewallLists(1, fwTCP80)
+
+		if _, err := cs.EnsureLoadBalancer(t.Context(), "cluster", service, proxyNodes); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := cs.pendingJobs.get("id-tcp-80"); ok {
+			t.Error("the rule is still claimed")
+		}
+	})
+
 	t.Run("other error of the job query is returned", func(t *testing.T) {
 		m := newPendingJobTestMocks(t)
 		service := proxyService(false, tcp80)
@@ -342,6 +400,28 @@ func TestPendingJobsUpdateLoadBalancer(t *testing.T) {
 	})
 }
 
+func TestPendingJobsDeletedRule(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockLB := cloudstack.NewMockLoadBalancerServiceIface(ctrl)
+	mockLB.EXPECT().NewDeleteLoadBalancerRuleParams("id-tcp-80").Return(&cloudstack.DeleteLoadBalancerRuleParams{})
+	mockLB.EXPECT().DeleteLoadBalancerRule(gomock.Any()).Return(&cloudstack.DeleteLoadBalancerRuleResponse{}, nil)
+
+	rule := testLBRule("tcp-80", "30080", "80")
+	lb := &loadBalancer{
+		CloudStackClient: &cloudstack.CloudStackClient{LoadBalancer: mockLB},
+		rules:            map[string]*cloudstack.LoadBalancerRule{rule.Name: rule},
+		pendingJobs:      newPendingJobs(),
+	}
+	lb.pendingJobs.set(rule.Id, pendingJob{jobID: testJobID, op: "assign", submitted: time.Now()})
+
+	if err := lb.deleteLoadBalancerRule(rule); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := lb.pendingJobs.get(rule.Id); ok {
+		t.Error("the job of the deleted rule is still tracked")
+	}
+}
+
 func TestNewCSCloudAsyncJobTimeout(t *testing.T) {
 	cfg := func(timeout *int) *CSConfig {
 		c := &CSConfig{}
@@ -361,6 +441,9 @@ func TestNewCSCloudAsyncJobTimeout(t *testing.T) {
 	}{
 		{"unset", nil, false},
 		{"set", ptr(120), false},
+		{"maximum", ptr(86400), false},
+		{"above the maximum", ptr(86401), true},
+		{"overflow", ptr(10000000000), true},
 		{"zero", ptr(0), true},
 		{"negative", ptr(-1), true},
 	} {

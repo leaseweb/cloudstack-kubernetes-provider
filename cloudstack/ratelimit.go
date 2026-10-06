@@ -153,7 +153,13 @@ func (t *rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, err
 // isAPIThrottled returns whether err is from a request that CloudStack rejected with HTTP 429 after all retries.
 // cloudstack-go returns the error of a rejected request as text only, so the text is checked.
 func isAPIThrottled(err error) bool {
-	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("CloudStack API error %d ", http.StatusTooManyRequests))
+	return isCloudStackError(err, http.StatusTooManyRequests)
+}
+
+// isCloudStackError returns true if err is a CloudStack API error with the given error code. cloudstack-go returns
+// the error as text only, so the text is checked.
+func isCloudStackError(err error, code int) bool {
+	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("CloudStack API error %d ", code))
 }
 
 // waitToSend blocks until the shared backoff ends and the rate limit allows a request. If a rejection starts a new

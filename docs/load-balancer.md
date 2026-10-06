@@ -95,7 +95,9 @@ When an assign or remove job takes longer than `async-job-timeout`, CloudStack s
 error processing service <namespace>/<name> (retrying in 1m0s): … waiting for CloudStack jobs: assign job <job-id> for load balancer rule <rule>: CloudStack job is still running
 ```
 
-This is expected while the VR is busy. The other rules of the service are still reconciled.
+This is expected while the VR is busy. The other rules of the service are still reconciled. When the node sync of the service controller finds a running job, it also records an `UpdateLoadBalancerFailed` event, and its `Successfully updated N out of M load balancers` line counts that service as not updated. This is also expected while jobs are running.
+
+The CCM keeps the running jobs in memory only. After a restart of the CCM, or when another replica becomes the leader, it does not know the running jobs, and it can send a job again once.
 
 ### Use a stable set of load balancer nodes
 
@@ -117,6 +119,6 @@ Then a rollout of the other nodes changes no load balancer rules at all.
 
 If all nodes are load balancer backends:
 
-- Replace one node only after the previous VM destroy has finished and the CCM logged `Successfully updated N out of N load balancers to direct traffic to the updated set of nodes`.
+- Replace one node only after the previous VM destroy has finished, and the CCM no longer logs `waiting for CloudStack jobs` and has logged `Successfully updated N out of N load balancers to direct traffic to the updated set of nodes`.
 - Replace several nodes per step (a larger `maxSurge` / `maxUnavailable`) instead of one node at a time. One assign per rule can add several new nodes, so this needs fewer VR commands per node.
 

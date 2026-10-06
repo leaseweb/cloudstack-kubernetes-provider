@@ -129,8 +129,9 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 
 	asyncJobTimeout := defaultAsyncJobTimeout
 	if cfg.Global.AsyncJobTimeout != nil {
-		if *cfg.Global.AsyncJobTimeout <= 0 {
-			return nil, fmt.Errorf("invalid cloud provider configuration: async-job-timeout must be at least 1, got %d", *cfg.Global.AsyncJobTimeout)
+		if *cfg.Global.AsyncJobTimeout <= 0 || *cfg.Global.AsyncJobTimeout > int(maxAsyncJobTimeout/time.Second) {
+			return nil, fmt.Errorf("invalid cloud provider configuration: async-job-timeout must be between 1 and %d, got %d",
+				int(maxAsyncJobTimeout/time.Second), *cfg.Global.AsyncJobTimeout)
 		}
 		asyncJobTimeout = time.Duration(*cfg.Global.AsyncJobTimeout) * time.Second
 	}

@@ -43,12 +43,16 @@ const (
 	// cloudStackParamErrorCode is the error code of CloudStack for an invalid parameter value, for example an
 	// unknown job ID.
 	cloudStackParamErrorCode = 431
+
+	// maxAsyncJobTimeout is the highest allowed async-job-timeout.
+	maxAsyncJobTimeout = 24 * time.Hour
 )
 
 // errJobPending means that a CloudStack job for a load balancer rule is still running.
 var errJobPending = errors.New("CloudStack job is still running")
 
-// pendingJob is an assign or remove job that was still running when the CCM stopped waiting for it.
+// pendingJob is an assign or remove job that was still running when the CCM stopped waiting for it. An empty
+// jobID means that a reconcile is changing the rule at the moment (see claim).
 type pendingJob struct {
 	jobID     string
 	op        string
@@ -59,7 +63,8 @@ type pendingJob struct {
 // pendingJobs has the running jobs per load balancer rule ID. When an assign or remove job takes longer than the
 // async timeout, CloudStack still runs it. Without this, the next reconcile does not see the change yet and sends
 // the same job again, which puts one more load balancer config update in the queue of the virtual router.
-// A nil *pendingJobs is valid and disables the tracking.
+// The jobs are only kept in memory. After a restart or a change of the leader, the CCM does not know the running
+// jobs, and it can send a job again once. A nil *pendingJobs is valid and disables the tracking.
 type pendingJobs struct {
 	mu   sync.Mutex
 	jobs map[string]pendingJob
@@ -80,6 +85,38 @@ func (p *pendingJobs) get(ruleID string) (pendingJob, bool) {
 	job, ok := p.jobs[ruleID]
 
 	return job, ok
+}
+
+// claim marks the rule as being changed by this reconcile. It returns false if another reconcile has claimed the
+// rule or a job is tracked for it. A nil *pendingJobs always returns true.
+func (p *pendingJobs) claim(ruleID string) bool {
+	if p == nil {
+		return true
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.jobs[ruleID]; ok {
+		return false
+	}
+	p.jobs[ruleID] = pendingJob{submitted: time.Now()}
+
+	return true
+}
+
+// release removes the claim of the rule, unless a job was stored for it in the meantime.
+func (p *pendingJobs) release(ruleID string) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if job, ok := p.jobs[ruleID]; ok && job.jobID == "" {
+		delete(p.jobs, ruleID)
+	}
 }
 
 func (p *pendingJobs) set(ruleID string, job pendingJob) {
@@ -121,10 +158,15 @@ func (lb *loadBalancer) checkPendingJob(lbRule *cloudstack.LoadBalancerRule) err
 		return nil
 	}
 
+	if job.jobID == "" {
+		return fmt.Errorf("load balancer rule %v is being changed by another reconcile: %w", lbRule.Name, errJobPending)
+	}
+
 	r, err := lb.Asyncjob.QueryAsyncJobResult(lb.Asyncjob.NewQueryAsyncJobResultParams(job.jobID))
 	if err != nil {
-		if isCloudStackError(err, cloudStackParamErrorCode) {
-			// CloudStack returns error 431 for an unknown job ID, for example when the job was cleaned up.
+		if isCloudStackError(err, cloudStackParamErrorCode) && strings.Contains(strings.ToLower(err.Error()), "jobid") {
+			// CloudStack returns error 431 for an unknown job ID, for example when the job was cleaned up. Other
+			// 431 errors keep the job, so it is not sent again.
 			klog.Warningf("The %s job %s for load balancer rule %v is not known in CloudStack anymore: %v", job.op, job.jobID, lbRule.Name, err)
 			lb.pendingJobs.delete(lbRule.Id)
 
@@ -158,11 +200,6 @@ func pendingJobsError(pending []string) error {
 	}
 
 	return api.NewRetryError("waiting for CloudStack jobs: "+strings.Join(pending, "; "), pendingJobRetryAfter)
-}
-
-// isCloudStackError returns true if err is a CloudStack API error with the given HTTP status code.
-func isCloudStackError(err error, code int) bool {
-	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("CloudStack API error %d ", code))
 }
 
 // keepVMCache returns true if the VM cache stays valid after the error: CloudStack throttled the request, or the
