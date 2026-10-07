@@ -106,9 +106,9 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 		return nil, false, err
 	}
 
-	// If we don't have any rules, the load balancer does not exist.
+	// If we don't have any rules, the load balancer does not exist, unless it still has an IP to release.
 	if len(lb.rules) == 0 {
-		return nil, false, nil
+		return cs.orphanedLoadBalancerStatus(lb, service)
 	}
 
 	klog.V(4).Infof("Found a load balancer associated with IP %v", lb.ipAddr)
@@ -568,36 +568,77 @@ func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1
 	return true, nil
 }
 
-// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
-// This handles the case where all LB rules were successfully deleted but IP release failed on a prior attempt.
-func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
-	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
-	if annotatedIP == "" {
-		return nil
+// needsLoadBalancerCleanup returns true if the load balancer of the service must be deleted: the service is being
+// deleted, or it is no longer a service of type LoadBalancer that this controller handles.
+func needsLoadBalancerCleanup(service *corev1.Service) bool {
+	return !service.DeletionTimestamp.IsZero() || service.Spec.Type != corev1.ServiceTypeLoadBalancer || service.Spec.LoadBalancerClass != nil
+}
+
+// orphanedLoadBalancerStatus returns the status of a load balancer without rules. A service that is cleaned up can
+// still have an IP that was not released, for example because deleting its rules timed out. The service controller
+// only calls EnsureLoadBalancerDeleted when the load balancer exists, so it is reported as existing until the IP is
+// released.
+func (cs *CSCloud) orphanedLoadBalancerStatus(lb *loadBalancer, service *corev1.Service) (*corev1.LoadBalancerStatus, bool, error) {
+	if !needsLoadBalancerCleanup(service) {
+		return nil, false, nil
 	}
 
-	found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
-	if lookupErr != nil {
-		klog.Warningf("Error looking up annotated IP %v during delete: %v", annotatedIP, lookupErr)
+	ip, err := cs.orphanedLoadBalancerIP(lb, service)
+	if err != nil || ip == "" {
+		return nil, false, err
+	}
 
-		return nil
+	klog.V(2).Infof("Load balancer for service %s/%s has no rules left, but its IP %v is still allocated", service.Namespace, service.Name, ip)
+
+	return &corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: ip}}}, true, nil
+}
+
+// orphanedLoadBalancerIP returns the IP in the service annotation if it is still allocated and should be released
+// (see shouldReleaseLoadBalancerIP), or "" if there is none. If the service also has the IP ID annotation, the
+// allocated IP must have that ID. It sets the address and its ID on lb.
+func (cs *CSCloud) orphanedLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (string, error) {
+	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
+	if annotatedIP == "" {
+		return "", nil
+	}
+
+	found, err := lb.lookupPublicIPAddress(annotatedIP)
+	if err != nil {
+		return "", fmt.Errorf("error looking up annotated IP %v of the load balancer: %w", annotatedIP, err)
 	}
 
 	if !found {
-		return nil
+		return "", nil
 	}
 
-	shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
-	if shouldErr != nil {
-		klog.Warningf("Error checking if annotated IP %v should be released: %v", annotatedIP, shouldErr)
+	if annotatedID := getLoadBalancerID(service); annotatedID != "" && annotatedID != lb.ipAddrID {
+		klog.V(4).Infof("Annotated IP %v has ID %v, not the annotated ID %v; not releasing it", annotatedIP, lb.ipAddrID, annotatedID)
 
-		return nil
+		return "", nil
+	}
+
+	shouldRelease, err := cs.shouldReleaseLoadBalancerIP(lb, service)
+	if err != nil {
+		return "", fmt.Errorf("error checking if annotated IP %v should be released: %w", annotatedIP, err)
 	}
 
 	if !shouldRelease {
 		klog.V(4).Infof("Annotated IP %v should not be released (keep-ip set or has other rules)", annotatedIP)
 
-		return nil
+		return "", nil
+	}
+
+	return annotatedIP, nil
+}
+
+// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
+// This handles the case where all LB rules were deleted but the IP was not released on a prior attempt, for
+// example because deleting the rules timed out. Errors are returned, so the service controller retries and does
+// not remove the finalizer while the IP may still be allocated.
+func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
+	annotatedIP, err := cs.orphanedLoadBalancerIP(lb, service)
+	if err != nil || annotatedIP == "" {
+		return err
 	}
 
 	if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
