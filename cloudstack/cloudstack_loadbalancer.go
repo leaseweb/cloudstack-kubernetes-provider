@@ -578,8 +578,11 @@ func needsLoadBalancerCleanup(service *corev1.Service) bool {
 // still have an IP that was not released, for example because deleting its rules timed out. The service controller
 // only calls EnsureLoadBalancerDeleted when the load balancer exists, so it is reported as existing until the IP is
 // released.
+//
+// This needs the ID annotation, which the CCM only sets after it took over the IP. An IP that a user requested in
+// the address annotation, but that the CCM never used, is not reported, so it is not released.
 func (cs *CSCloud) orphanedLoadBalancerStatus(lb *loadBalancer, service *corev1.Service) (*corev1.LoadBalancerStatus, bool, error) {
-	if !needsLoadBalancerCleanup(service) {
+	if !needsLoadBalancerCleanup(service) || getLoadBalancerID(service) == "" {
 		return nil, false, nil
 	}
 
@@ -594,28 +597,39 @@ func (cs *CSCloud) orphanedLoadBalancerStatus(lb *loadBalancer, service *corev1.
 }
 
 // orphanedLoadBalancerIP returns the IP in the service annotation if it is still allocated and should be released
-// (see shouldReleaseLoadBalancerIP), or "" if there is none. If the service also has the IP ID annotation, the
-// allocated IP must have that ID. It sets the address and its ID on lb.
+// (see shouldReleaseLoadBalancerIP), or "" if there is none. It sets the address and its ID on lb.
+//
+// If the service has the ID annotation, the IP must have that ID. A source NAT or static NAT IP is never released,
+// because CloudStack would refuse to release it on every retry.
 func (cs *CSCloud) orphanedLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (string, error) {
 	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
 	if annotatedIP == "" {
 		return "", nil
 	}
 
-	found, err := lb.lookupPublicIPAddress(annotatedIP)
+	addr, err := lb.findPublicIPAddress(annotatedIP)
 	if err != nil {
 		return "", fmt.Errorf("error looking up annotated IP %v of the load balancer: %w", annotatedIP, err)
 	}
 
-	if !found {
+	if addr == nil {
 		return "", nil
 	}
 
-	if annotatedID := getLoadBalancerID(service); annotatedID != "" && annotatedID != lb.ipAddrID {
-		klog.V(4).Infof("Annotated IP %v has ID %v, not the annotated ID %v; not releasing it", annotatedIP, lb.ipAddrID, annotatedID)
+	if annotatedID := getLoadBalancerID(service); annotatedID != "" && addr.Id != annotatedID {
+		klog.V(4).Infof("Annotated IP %v has ID %v, not the annotated ID %v; not releasing it", annotatedIP, addr.Id, annotatedID)
 
 		return "", nil
 	}
+
+	if addr.Issourcenat || addr.Isstaticnat {
+		klog.V(4).Infof("Annotated IP %v is a source NAT or static NAT IP; not releasing it", annotatedIP)
+
+		return "", nil
+	}
+
+	lb.ipAddr = addr.Ipaddress
+	lb.ipAddrID = addr.Id
 
 	shouldRelease, err := cs.shouldReleaseLoadBalancerIP(lb, service)
 	if err != nil {
@@ -1016,6 +1030,19 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 // If not found or not allocated, it returns (false, nil) without modifying lb state.
 // Unlike getPublicIPAddress, this method does NOT call associatePublicIPAddress for unallocated IPs.
 func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
+	addr, err := lb.findPublicIPAddress(ip)
+	if err != nil || addr == nil {
+		return false, err
+	}
+
+	lb.ipAddr = addr.Ipaddress
+	lb.ipAddrID = addr.Id
+
+	return true, nil
+}
+
+// findPublicIPAddress returns the allocated public IP with the given address, or nil if there is none.
+func (lb *loadBalancer) findPublicIPAddress(ip string) (*cloudstack.PublicIpAddress, error) {
 	p := lb.Address.NewListPublicIpAddressesParams()
 	p.SetIpaddress(ip)
 	p.SetAllocatedonly(true)
@@ -1027,17 +1054,14 @@ func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
 
 	l, err := lb.Address.ListPublicIpAddresses(p)
 	if err != nil {
-		return false, fmt.Errorf("error looking up IP address %v: %w", ip, err)
+		return nil, fmt.Errorf("error looking up IP address %v: %w", ip, err)
 	}
 
 	if l.Count != 1 {
-		return false, nil
+		return nil, nil //nolint:nilnil // No allocated IP is not an error.
 	}
 
-	lb.ipAddr = l.PublicIpAddresses[0].Ipaddress
-	lb.ipAddrID = l.PublicIpAddresses[0].Id
-
-	return true, nil
+	return l.PublicIpAddresses[0], nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.

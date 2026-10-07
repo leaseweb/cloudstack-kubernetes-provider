@@ -69,6 +69,17 @@ func (m orphanedIPMocks) expectRuleLists(counts ...int) {
 	}).Times(len(counts))
 }
 
+// expectNATIPLookup sets up one listPublicIpAddresses call that returns the IP ip-1 as a source NAT or static NAT IP.
+func (m orphanedIPMocks) expectNATIPLookup(sourceNAT, staticNAT bool) {
+	m.address.EXPECT().NewListPublicIpAddressesParams().Return(&cloudstack.ListPublicIpAddressesParams{})
+	m.address.EXPECT().ListPublicIpAddresses(gomock.Any()).Return(&cloudstack.ListPublicIpAddressesResponse{
+		Count: 1,
+		PublicIpAddresses: []*cloudstack.PublicIpAddress{
+			{Id: "ip-1", Ipaddress: "10.0.0.1", Issourcenat: sourceNAT, Isstaticnat: staticNAT},
+		},
+	}, nil)
+}
+
 // expectIPLookup sets up one listPublicIpAddresses call that returns the IP with the ID, or no IP if id is "".
 func (m orphanedIPMocks) expectIPLookup(id string, err error) {
 	m.address.EXPECT().NewListPublicIpAddressesParams().Return(&cloudstack.ListPublicIpAddressesParams{})
@@ -183,6 +194,35 @@ func TestGetLoadBalancerOrphanedIP(t *testing.T) {
 			},
 		},
 		{
+			name: "IP without the ID annotation",
+			service: func() *corev1.Service {
+				service := deletedLBService(nil)
+				delete(service.Annotations, ServiceAnnotationLoadBalancerID)
+
+				return service
+			},
+			setup: func(m orphanedIPMocks) {
+				// Name and legacy name lookup only, and no IP lookup: the CCM never took over this IP.
+				m.expectRuleLists(0, 0)
+			},
+		},
+		{
+			name:    "source NAT IP",
+			service: func() *corev1.Service { return deletedLBService(nil) },
+			setup: func(m orphanedIPMocks) {
+				m.expectRuleLists(0, 0, 0)
+				m.expectNATIPLookup(true, false)
+			},
+		},
+		{
+			name:    "static NAT IP",
+			service: func() *corev1.Service { return deletedLBService(nil) },
+			setup: func(m orphanedIPMocks) {
+				m.expectRuleLists(0, 0, 0)
+				m.expectNATIPLookup(false, true)
+			},
+		},
+		{
 			name: "service is not cleaned up",
 			service: func() *corev1.Service {
 				service := deletedLBService(nil)
@@ -259,5 +299,27 @@ func TestReleaseOrphanedIPReturnsLookupErrors(t *testing.T) {
 	service := deletedLBService(nil)
 	if err := m.newCSCloud(service).EnsureLoadBalancerDeleted(t.Context(), "cluster", service); err == nil {
 		t.Fatal("expected an error, so the finalizer is not removed while the IP may still be allocated")
+	}
+}
+
+func TestReleaseOrphanedIPSkipsNATIPs(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		sourceNAT, staticNAT bool
+	}{
+		{"source NAT", true, false},
+		{"static NAT", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newOrphanedIPMocks(t)
+			m.expectRuleLists(0, 0, 0)
+			m.expectNATIPLookup(tc.sourceNAT, tc.staticNAT)
+
+			// No DisassociateIpAddress call is expected.
+			service := deletedLBService(nil)
+			if err := m.newCSCloud(service).EnsureLoadBalancerDeleted(t.Context(), "cluster", service); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
