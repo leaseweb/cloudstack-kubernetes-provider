@@ -12,6 +12,11 @@ secret-key    = <CloudStack API Secret>
 project-id    = <CloudStack Project UUID (optional)>
 zone          = <CloudStack Zone Name (optional)>
 ssl-no-verify = <Disable SSL certificate validation: true or false (optional)>
+
+api-rate-limit-qps   = <Maximum CloudStack API requests per second (optional, default 10)>
+api-rate-limit-burst = <Requests that may exceed the QPS for a short time (optional, default 20)>
+vm-cache-ttl         = <Seconds to cache the VM list for load balancer host lookups (optional, default 30)>
+async-job-timeout    = <Seconds to wait for a CloudStack async job (optional, default 300)>
 ```
 
 | Field | Required | Description |
@@ -22,8 +27,18 @@ ssl-no-verify = <Disable SSL certificate validation: true or false (optional)>
 | `project-id` | No | UUID of the CloudStack project. Required when nodes are in a project |
 | `zone` | No | CloudStack zone name to scope operations to |
 | `ssl-no-verify` | No | Set to `true` to skip TLS certificate verification |
+| `api-rate-limit-qps` | No | Maximum number of CloudStack API requests per second, including async job polls. Default `10`. Set to `0` to disable the rate limit. Must not be negative |
+| `api-rate-limit-burst` | No | Number of requests that may exceed the QPS for a short time. Must be at least `1` when the rate limit is enabled. Default `20` |
+| `vm-cache-ttl` | No | Number of seconds that the list of VMs is cached for load balancer host lookups, so that many services share one `listVirtualMachines` call. The list is fetched again when it does not match all nodes, or when a node is newer than the list. Default `30`. Set to `0` to disable the cache |
+| `async-job-timeout` | No | Number of seconds that the CCM waits for a CloudStack async job, such as assigning VMs to a load balancer rule. Default `300`. Must be at least `1`. See [Large clusters and node rollouts](load-balancer.md#large-clusters-and-node-rollouts) |
 
 The API credentials need permission to fetch VM information and manage load balancers in the project or domain where the nodes reside.
+
+### API rate limiting
+
+When the CCM starts, it reconciles all `LoadBalancer` services at once. On clusters with many services, this can send many requests to the CloudStack management server. The `api-rate-limit-qps` and `api-rate-limit-burst` settings limit the request rate of the CCM.
+
+If API throttling (`api.throttling.enabled`) is enabled in CloudStack and a request is rejected with HTTP 429, the CCM pauses all its requests for an increasing delay, and retries the request up to 5 times. CloudStack does not execute rejected requests, so a retry is safe. Set `api-rate-limit-qps` below the `api.throttling.max` / `api.throttling.interval` of the CCM account to prevent rejections.
 
 ## Helm Chart Values
 

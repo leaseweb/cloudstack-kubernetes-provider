@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	corev1 "k8s.io/api/core/v1"
@@ -82,6 +83,15 @@ type loadBalancer struct {
 	networkID string
 	projectID string
 	rules     map[string]*cloudstack.LoadBalancerRule
+
+	// firewallRules has the firewall rules of each public IP ID that updateFirewallRule fetched, so the ports
+	// of a service share one listFirewallRules call. Each port only uses the rules for its own protocol and port,
+	// and the protocol/port pairs of a service are unique, so the changes for one port do not change the rules
+	// that another port uses. A nil map disables this.
+	firewallRules map[string][]*cloudstack.FirewallRule
+
+	// pendingJobs has the assign and remove jobs that are still running. nil disables the tracking.
+	pendingJobs *pendingJobs
 }
 
 // GetLoadBalancer returns whether the specified load balancer exists, and if so, what its status is.
@@ -96,9 +106,9 @@ func (cs *CSCloud) GetLoadBalancer(ctx context.Context, clusterName string, serv
 		return nil, false, err
 	}
 
-	// If we don't have any rules, the load balancer does not exist.
+	// If we don't have any rules, the load balancer does not exist, unless it still has an IP to release.
 	if len(lb.rules) == 0 {
-		return nil, false, nil
+		return cs.orphanedLoadBalancerStatus(lb, service)
 	}
 
 	klog.V(4).Infof("Found a load balancer associated with IP %v", lb.ipAddr)
@@ -117,6 +127,15 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	if len(service.Spec.Ports) == 0 {
 		return nil, errors.New("requested load balancer with no ports")
 	}
+
+	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request or a job is still running, so the retries do not each
+	// fetch the list again.
+	defer func() {
+		if err != nil && !keepVMCache(err) {
+			cs.vmCache.invalidate()
+		}
+	}()
 
 	// Patch the service with new/updated annotations if needed after EnsureLoadBalancer finishes.
 	patcher := newServicePatcher(cs.kclient, service)
@@ -188,6 +207,18 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	setServiceAnnotation(service, ServiceAnnotationLoadBalancerID, lb.ipAddrID)
 	setServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkID, lb.networkID)
 
+	// These lookups give the same result for each port, so they are done at the first port and reused for the
+	// other ports. This reduces the number of API calls but keeps the order of the calls for the first port.
+	var network *cloudstack.Network
+	var lbSourceRanges utilnet.IPNetSet
+	lb.firewallRules = map[string][]*cloudstack.FirewallRule{}
+
+	desiredRuleNames, desiredFirewallPorts := desiredRules(lb.name, service)
+
+	// Rules with a CloudStack job that is still running. The other rules are still reconciled, and the service
+	// is retried later.
+	var pendingRules []string
+
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
 		protocol := ProtocolFromServicePort(port, service)
@@ -196,12 +227,25 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		// All ports have their own load balancer rule, so add the port to lbName to keep the names unique.
-		lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
+		lbRuleName := loadBalancerRuleName(lb.name, protocol, port.Port)
+
+		// If the protocol of the port changed between tcp and tcp-proxy, the rule name changed too. CloudStack does
+		// not allow a second rule on the same public port, so switch the existing rule instead of creating one.
+		if err := cs.switchLoadBalancerRule(lb, service, lbRuleName, port, protocol, desiredRuleNames); err != nil {
+			return nil, err
+		}
 
 		// If the load balancer rule exists and is up-to-date, we move on to the next rule.
+		_, ruleExisted := lb.rules[lbRuleName]
 		lbRule, needsUpdate, err := lb.checkLoadBalancerRule(lbRuleName, port, protocol)
 		if err != nil {
 			return nil, err
+		}
+
+		if ruleExisted && lbRule == nil {
+			// checkLoadBalancerRule deleted the load balancer rule. Fetch the firewall rules again in
+			// case CloudStack also changed them.
+			clear(lb.firewallRules)
 		}
 
 		if lbRule != nil { //nolint:nestif
@@ -215,7 +259,10 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			}
 
 			if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
-				return nil, err
+				if !errors.Is(err, errJobPending) {
+					return nil, err
+				}
+				pendingRules = append(pendingRules, err.Error())
 			}
 
 			// Delete the rule from the map, to prevent it being deleted.
@@ -229,22 +276,28 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 			klog.V(4).Infof("Assigning hosts (%v) to load balancer rule: %v", lb.hostIDs, lbRuleName)
 			if err = lb.assignHostsToRule(lbRule, lb.hostIDs); err != nil {
+				if !errors.Is(err, errJobPending) {
+					return nil, err
+				}
+				pendingRules = append(pendingRules, err.Error())
+			}
+		}
+
+		if network == nil {
+			var count int
+			network, count, err = lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
+			if err != nil {
+				if count == 0 {
+					return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
+				}
+
+				return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
+			}
+
+			lbSourceRanges, err = getLoadBalancerSourceRanges(service)
+			if err != nil {
 				return nil, err
 			}
-		}
-
-		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
-		if err != nil {
-			if count == 0 {
-				return nil, fmt.Errorf("could not find network with ID %s: %w", lb.networkID, err)
-			}
-
-			return nil, fmt.Errorf("failed to get network with ID %s: %w", lb.networkID, err)
-		}
-
-		lbSourceRanges, err := getLoadBalancerSourceRanges(service)
-		if err != nil {
-			return nil, err
 		}
 
 		if lbRule != nil && isFirewallSupported(network.Service) {
@@ -270,9 +323,15 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, fmt.Errorf("error parsing port %s: %w", lbRule.Publicport, err)
 		}
 
-		klog.V(4).Infof("Deleting firewall rules associated with load balancer rule: %v (%v:%v:%v)", lbRule.Name, protocol, lbRule.Publicip, port)
-		if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
-			return nil, err
+		// Keep the firewall rules if a port of the service still uses the same protocol and port, for example when
+		// both a tcp and a tcp-proxy rule exist for the same port.
+		if desiredFirewallPorts[firewallPortKey(protocol, int(port))] {
+			klog.V(4).Infof("Keeping firewall rules of load balancer rule %v, because %v/%v is still in use", lbRule.Name, protocol.IPProtocol(), port)
+		} else {
+			klog.V(4).Infof("Deleting firewall rules associated with load balancer rule: %v (%v:%v:%v)", lbRule.Name, protocol, lbRule.Publicip, port)
+			if _, err := lb.deleteFirewallRule(lbRule.Publicipid, int(port), protocol); err != nil {
+				return nil, err
+			}
 		}
 
 		klog.V(4).Infof("Deleting obsolete load balancer rule: %v", lbRule.Name)
@@ -281,12 +340,25 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 	}
 
+	if err := pendingJobsError(pendingRules); err != nil {
+		return nil, err
+	}
+
 	return lb.generateLoadBalancerStatus(service), nil
 }
 
 // UpdateLoadBalancer updates hosts under the specified load balancer.
-func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) error {
+func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) (err error) {
 	klog.V(4).InfoS("UpdateLoadBalancer", "cluster", clusterName, "service", klog.KObj(service))
+
+	// Drop the cached VM list on failure, so the retry uses a new list (for example when a VM was deleted).
+	// Keep it when CloudStack throttled the request or a job is still running, so the retries do not each
+	// fetch the list again.
+	defer func() {
+		if err != nil && !keepVMCache(err) {
+			cs.vmCache.invalidate()
+		}
+	}()
 
 	// Get the load balancer details and existing rules.
 	name := cs.GetLoadBalancerName(ctx, clusterName, service)
@@ -302,13 +374,19 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 		return err
 	}
 
+	// Rules with a CloudStack job that is still running. The other rules are still reconciled, and the service
+	// is retried later.
+	var pendingRules []string
 	for _, lbRule := range lb.rules {
 		if err := lb.reconcileHostsForRule(lbRule, lb.hostIDs); err != nil {
-			return err
+			if !errors.Is(err, errJobPending) {
+				return err
+			}
+			pendingRules = append(pendingRules, err.Error())
 		}
 	}
 
-	return nil
+	return pendingJobsError(pendingRules)
 }
 
 // isFirewallSupported checks whether a CloudStack network supports the Firewall service.
@@ -490,36 +568,91 @@ func (cs *CSCloud) shouldReleaseLoadBalancerIP(lb *loadBalancer, service *corev1
 	return true, nil
 }
 
-// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
-// This handles the case where all LB rules were successfully deleted but IP release failed on a prior attempt.
-func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
+// needsLoadBalancerCleanup returns true if the load balancer of the service must be deleted: the service is being
+// deleted, or it is no longer a service of type LoadBalancer that this controller handles.
+func needsLoadBalancerCleanup(service *corev1.Service) bool {
+	return !service.DeletionTimestamp.IsZero() || service.Spec.Type != corev1.ServiceTypeLoadBalancer || service.Spec.LoadBalancerClass != nil
+}
+
+// orphanedLoadBalancerStatus returns the status of a load balancer without rules. A service that is cleaned up can
+// still have an IP that was not released, for example because deleting its rules timed out. The service controller
+// only calls EnsureLoadBalancerDeleted when the load balancer exists, so it is reported as existing until the IP is
+// released.
+//
+// This needs the ID annotation, which the CCM only sets after it took over the IP. An IP that a user requested in
+// the address annotation, but that the CCM never used, is not reported, so it is not released.
+func (cs *CSCloud) orphanedLoadBalancerStatus(lb *loadBalancer, service *corev1.Service) (*corev1.LoadBalancerStatus, bool, error) {
+	if !needsLoadBalancerCleanup(service) || getLoadBalancerID(service) == "" {
+		return nil, false, nil
+	}
+
+	ip, err := cs.orphanedLoadBalancerIP(lb, service)
+	if err != nil || ip == "" {
+		return nil, false, err
+	}
+
+	klog.V(2).Infof("Load balancer for service %s/%s has no rules left, but its IP %v is still allocated", service.Namespace, service.Name, ip)
+
+	return &corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: ip}}}, true, nil
+}
+
+// orphanedLoadBalancerIP returns the IP in the service annotation if it is still allocated and should be released
+// (see shouldReleaseLoadBalancerIP), or "" if there is none. It sets the address and its ID on lb.
+//
+// If the service has the ID annotation, the IP must have that ID. A source NAT or static NAT IP is never released,
+// because CloudStack would refuse to release it on every retry.
+func (cs *CSCloud) orphanedLoadBalancerIP(lb *loadBalancer, service *corev1.Service) (string, error) {
 	annotatedIP := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerAddress, "")
 	if annotatedIP == "" {
-		return nil
+		return "", nil
 	}
 
-	found, lookupErr := lb.lookupPublicIPAddress(annotatedIP)
-	if lookupErr != nil {
-		klog.Warningf("Error looking up annotated IP %v during delete: %v", annotatedIP, lookupErr)
-
-		return nil
+	addr, err := lb.findPublicIPAddress(annotatedIP)
+	if err != nil {
+		return "", fmt.Errorf("error looking up annotated IP %v of the load balancer: %w", annotatedIP, err)
 	}
 
-	if !found {
-		return nil
+	if addr == nil {
+		return "", nil
 	}
 
-	shouldRelease, shouldErr := cs.shouldReleaseLoadBalancerIP(lb, service)
-	if shouldErr != nil {
-		klog.Warningf("Error checking if annotated IP %v should be released: %v", annotatedIP, shouldErr)
+	if annotatedID := getLoadBalancerID(service); annotatedID != "" && addr.Id != annotatedID {
+		klog.V(4).Infof("Annotated IP %v has ID %v, not the annotated ID %v; not releasing it", annotatedIP, addr.Id, annotatedID)
 
-		return nil
+		return "", nil
+	}
+
+	if addr.Issourcenat || addr.Isstaticnat {
+		klog.V(4).Infof("Annotated IP %v is a source NAT or static NAT IP; not releasing it", annotatedIP)
+
+		return "", nil
+	}
+
+	lb.ipAddr = addr.Ipaddress
+	lb.ipAddrID = addr.Id
+
+	shouldRelease, err := cs.shouldReleaseLoadBalancerIP(lb, service)
+	if err != nil {
+		return "", fmt.Errorf("error checking if annotated IP %v should be released: %w", annotatedIP, err)
 	}
 
 	if !shouldRelease {
 		klog.V(4).Infof("Annotated IP %v should not be released (keep-ip set or has other rules)", annotatedIP)
 
-		return nil
+		return "", nil
+	}
+
+	return annotatedIP, nil
+}
+
+// releaseOrphanedIPIfNeeded checks the service annotation for an orphaned IP and releases it if appropriate.
+// This handles the case where all LB rules were deleted but the IP was not released on a prior attempt, for
+// example because deleting the rules timed out. Errors are returned, so the service controller retries and does
+// not remove the finalizer while the IP may still be allocated.
+func (cs *CSCloud) releaseOrphanedIPIfNeeded(lb *loadBalancer, service *corev1.Service) error {
+	annotatedIP, err := cs.orphanedLoadBalancerIP(lb, service)
+	if err != nil || annotatedIP == "" {
+		return err
 	}
 
 	if releaseErr := lb.releaseLoadBalancerIP(); releaseErr != nil {
@@ -584,6 +717,7 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service, name, legacyName str
 func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer, error) {
 	lb := &loadBalancer{
 		CloudStackClient: cs.client,
+		pendingJobs:      cs.pendingJobs,
 		name:             name,
 		projectID:        cs.projectID,
 		rules:            make(map[string]*cloudstack.LoadBalancerRule),
@@ -645,6 +779,7 @@ func (cs *CSCloud) getLoadBalancerByName(name, legacyName string) (*loadBalancer
 func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadBalancer, error) {
 	lb := &loadBalancer{
 		CloudStackClient: cs.client,
+		pendingJobs:      cs.pendingJobs,
 		name:             name,
 		projectID:        cs.projectID,
 		rules:            make(map[string]*cloudstack.LoadBalancerRule),
@@ -689,7 +824,74 @@ func (cs *CSCloud) getLoadBalancerByID(name, ipAddrID, networkID string) (*loadB
 // During rolling upgrades some nodes may not yet have a corresponding VM in CloudStack, so we tolerate
 // partial matches: as long as at least one node can be resolved we return the matched set and log
 // warnings for the nodes we could not find.
+//
+// The list of VMs can come from the VM cache. If the cached list does not give a complete match, or a node
+// is newer than the cached list, a new list is fetched and the match is done again. So the result is the
+// same as with a new list, unless VMs that match a node were changed or deleted within the cache TTL.
 func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
+	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
+	list, err := cs.vmCache.get(cs.listAllVirtualMachines, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
+	}
+
+	m := matchHosts(nodes, list.vms)
+	if !list.fresh && m.needsFreshList(nodes, list.fetchedAt) {
+		klog.V(4).Infof("Cached list of VMs does not match all %d node(s), fetching a new list", len(nodes))
+		list, err = cs.vmCache.get(cs.listAllVirtualMachines, &list)
+		if err != nil {
+			return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
+		}
+		m = matchHosts(nodes, list.vms)
+	}
+
+	if !list.fresh {
+		klog.V(4).Infof("Using cached list of %d VM(s), fetched %v ago", len(list.vms), time.Since(list.fetchedAt).Round(time.Millisecond))
+	}
+
+	for i, name := range m.skippedNoNIC {
+		klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", name, m.skippedNoNICIDs[i])
+	}
+
+	if m.err != nil {
+		return nil, "", m.err
+	}
+
+	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
+	if len(m.unmatchedNodes) > 0 {
+		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(m.unmatchedNodes), m.unmatchedNodes)
+	}
+	if len(m.skippedNoNIC) > 0 {
+		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(m.skippedNoNIC), m.skippedNoNIC)
+	}
+
+	if len(m.hostIDs) == 0 || len(m.networkID) == 0 {
+		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
+			len(nodes), m.unmatchedNodes, m.skippedNoNIC)
+	}
+
+	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(m.hostIDs), len(nodes))
+
+	return m.hostIDs, m.networkID, nil
+}
+
+// hostMatch is the result of matching nodes to VMs.
+type hostMatch struct {
+	hostIDs        []string
+	networkID      string
+	unmatchedNodes []string
+	skippedNoNIC   []string
+	// skippedNoNICIDs has the IDs of the VMs in skippedNoNIC, in the same order.
+	skippedNoNICIDs []string
+	// missingProviderID is true if the VM ID in the ProviderID of a node is not in the list of VMs.
+	missingProviderID bool
+	err               error
+}
+
+// matchHosts matches the nodes to the VMs by name and by the VM ID in the ProviderID of the node.
+func matchHosts(nodes []*corev1.Node, allVMs []*cloudstack.VirtualMachine) hostMatch {
+	var m hostMatch
+
 	hostNames := map[string]bool{}
 	// providerVMIDs maps CloudStack VM IDs extracted from node.Spec.ProviderID
 	// so we can match by ID in addition to name.
@@ -707,61 +909,71 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 		}
 	}
 
-	// Fetch all VMs using pagination to avoid missing VMs when the project has many instances.
-	allVMs, err := cs.listAllVirtualMachines()
-	if err != nil {
-		return nil, "", fmt.Errorf("error retrieving list of hosts: %w", err)
-	}
-
-	var hostIDs []string
-	var networkID string
 	matchedNames := map[string]bool{}
-	var skippedNoNIC []string
+	matchedVMIDs := map[string]bool{}
+	foundVMIDs := map[string]bool{}
 
 	// Check if the virtual machine is in the hosts slice, then add the corresponding ID.
 	for _, vm := range allVMs {
 		nameMatch := hostNames[strings.ToLower(vm.Name)]
 		idMatch := providerVMIDs[vm.Id]
+		if idMatch {
+			foundVMIDs[vm.Id] = true
+		}
 		if nameMatch || idMatch {
 			if len(vm.Nic) == 0 {
-				klog.Warningf("Skipping VM %v (id: %v) as it contains no active network interfaces (may still be provisioning)", vm.Name, vm.Id)
-				skippedNoNIC = append(skippedNoNIC, vm.Name)
+				m.skippedNoNIC = append(m.skippedNoNIC, vm.Name)
+				m.skippedNoNICIDs = append(m.skippedNoNICIDs, vm.Id)
 				// Skip VM's without any active network interfaces. This happens during rollout f.e.
 				continue
 			}
-			if networkID != "" && networkID != vm.Nic[0].Networkid {
-				return nil, "", errors.New("found hosts that belong to different networks")
+			if m.networkID != "" && m.networkID != vm.Nic[0].Networkid {
+				m.err = errors.New("found hosts that belong to different networks")
+
+				return m
 			}
 
-			networkID = vm.Nic[0].Networkid
-			hostIDs = append(hostIDs, vm.Id)
+			m.networkID = vm.Nic[0].Networkid
+			m.hostIDs = append(m.hostIDs, vm.Id)
 			matchedNames[strings.ToLower(vm.Name)] = true
+			matchedVMIDs[vm.Id] = true
 		}
 	}
 
-	// Log warnings for nodes that could not be matched — this is expected during rolling upgrades.
-	var unmatchedNodes []string
+	m.missingProviderID = len(foundVMIDs) < len(providerVMIDs)
+
+	// A node is matched by its name, or by the VM ID in its ProviderID when the node name differs from the VM name.
 	for _, node := range nodes {
 		shortName, _, _ := strings.Cut(strings.ToLower(node.Name), ".")
-		if !matchedNames[shortName] {
-			unmatchedNodes = append(unmatchedNodes, node.Name)
+		if matchedNames[shortName] {
+			continue
+		}
+		if id, _, err := instanceIDFromProviderID(node.Spec.ProviderID); err == nil && matchedVMIDs[id] {
+			continue
+		}
+		m.unmatchedNodes = append(m.unmatchedNodes, node.Name)
+	}
+
+	return m
+}
+
+// needsFreshList returns true if a match on a cached list of VMs (fetched at fetchedAt) may differ from a match
+// on a new list.
+func (m hostMatch) needsFreshList(nodes []*corev1.Node, fetchedAt time.Time) bool {
+	if m.err != nil || m.missingProviderID || len(m.unmatchedNodes) > 0 || len(m.skippedNoNIC) > 0 {
+		return true
+	}
+
+	// The API server stores the creation time of a node in whole seconds. A node that was created in the same
+	// second as the fetch may be newer than the list, so it also needs a new list.
+	fetchedAtSecond := fetchedAt.Truncate(time.Second)
+	for _, node := range nodes {
+		if !node.CreationTimestamp.Time.Before(fetchedAtSecond) {
+			return true
 		}
 	}
-	if len(unmatchedNodes) > 0 {
-		klog.Warningf("Could not match %d node(s) to CloudStack VMs (may be provisioning or terminating): %v", len(unmatchedNodes), unmatchedNodes)
-	}
-	if len(skippedNoNIC) > 0 {
-		klog.Warningf("Skipped %d VM(s) with no NICs (still provisioning): %v", len(skippedNoNIC), skippedNoNIC)
-	}
 
-	if len(hostIDs) == 0 || len(networkID) == 0 {
-		return nil, "", fmt.Errorf("could not match any of the %d node(s) to VMs in CloudStack (unmatched: %v, skipped-no-nic: %v)",
-			len(nodes), unmatchedNodes, skippedNoNIC)
-	}
-
-	klog.V(4).Infof("Matched %d of %d nodes to CloudStack VMs", len(hostIDs), len(nodes))
-
-	return hostIDs, networkID, nil
+	return false
 }
 
 // listAllVirtualMachines retrieves all VMs using pagination to handle large projects.
@@ -818,6 +1030,19 @@ func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 // If not found or not allocated, it returns (false, nil) without modifying lb state.
 // Unlike getPublicIPAddress, this method does NOT call associatePublicIPAddress for unallocated IPs.
 func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
+	addr, err := lb.findPublicIPAddress(ip)
+	if err != nil || addr == nil {
+		return false, err
+	}
+
+	lb.ipAddr = addr.Ipaddress
+	lb.ipAddrID = addr.Id
+
+	return true, nil
+}
+
+// findPublicIPAddress returns the allocated public IP with the given address, or nil if there is none.
+func (lb *loadBalancer) findPublicIPAddress(ip string) (*cloudstack.PublicIpAddress, error) {
 	p := lb.Address.NewListPublicIpAddressesParams()
 	p.SetIpaddress(ip)
 	p.SetAllocatedonly(true)
@@ -829,17 +1054,14 @@ func (lb *loadBalancer) lookupPublicIPAddress(ip string) (bool, error) {
 
 	l, err := lb.Address.ListPublicIpAddresses(p)
 	if err != nil {
-		return false, fmt.Errorf("error looking up IP address %v: %w", ip, err)
+		return nil, fmt.Errorf("error looking up IP address %v: %w", ip, err)
 	}
 
 	if l.Count != 1 {
-		return false, nil
+		return nil, nil //nolint:nilnil // No allocated IP is not an error.
 	}
 
-	lb.ipAddr = l.PublicIpAddresses[0].Ipaddress
-	lb.ipAddrID = l.PublicIpAddresses[0].Id
-
-	return true, nil
+	return l.PublicIpAddresses[0], nil
 }
 
 // getPublicIPAddressID retrieves the ID of the given IP, and sets the address and its ID.
@@ -924,6 +1146,106 @@ func (lb *loadBalancer) releaseLoadBalancerIP() error {
 	if _, err := lb.Address.DisassociateIpAddress(p); err != nil {
 		return fmt.Errorf("error releasing load balancer IP %v: %w", lb.ipAddr, err)
 	}
+
+	return nil
+}
+
+// loadBalancerRuleName returns the name of the load balancer rule for a protocol and port.
+func loadBalancerRuleName(lbName string, protocol LoadBalancerProtocol, port int32) string {
+	return fmt.Sprintf("%s-%s-%d", lbName, protocol, port)
+}
+
+// firewallPortKey returns the key of the firewall rules for a protocol and port. The tcp and tcp-proxy
+// protocols have the same key, because they use the same firewall rules.
+func firewallPortKey(protocol LoadBalancerProtocol, port int) string {
+	return fmt.Sprintf("%s/%d", protocol.IPProtocol(), port)
+}
+
+// desiredRules returns the names of the load balancer rules and the firewall keys (see firewallPortKey) for the
+// ports of the service. Ports with an invalid protocol are skipped; EnsureLoadBalancer returns an error for them.
+func desiredRules(lbName string, service *corev1.Service) (map[string]bool, map[string]bool) {
+	ruleNames := map[string]bool{}
+	firewallPorts := map[string]bool{}
+	for _, port := range service.Spec.Ports {
+		protocol := ProtocolFromServicePort(port, service)
+		if protocol == LoadBalancerProtocolInvalid {
+			continue
+		}
+		ruleNames[loadBalancerRuleName(lbName, protocol, port.Port)] = true
+		firewallPorts[firewallPortKey(protocol, int(port.Port))] = true
+	}
+
+	return ruleNames, firewallPorts
+}
+
+// findRuleForPort returns an existing load balancer rule for the same public IP, public port and IP protocol as
+// the port, but with another name. This is the rule of the port before its protocol changed between tcp and
+// tcp-proxy. Rules that another port of the service uses (desired) are not returned.
+func (lb *loadBalancer) findRuleForPort(lbRuleName string, port corev1.ServicePort, protocol LoadBalancerProtocol, desired map[string]bool) *cloudstack.LoadBalancerRule {
+	for name, rule := range lb.rules {
+		if name == lbRuleName || desired[name] {
+			continue
+		}
+		if rule.Publicip == lb.ipAddr && rule.Publicport == strconv.Itoa(int(port.Port)) &&
+			ProtocolFromLoadBalancer(rule.Protocol).IPProtocol() == protocol.IPProtocol() {
+			return rule
+		}
+	}
+
+	return nil
+}
+
+// switchLoadBalancerRule switches the existing rule of a port to the new rule name and protocol, if the protocol
+// of the port changed between tcp and tcp-proxy. If the node port is the same, the rule is updated in place, so its
+// hosts and firewall rules stay. Else the old rule is deleted, so the new rule can be created. The firewall rules
+// of the port are kept in both cases.
+func (cs *CSCloud) switchLoadBalancerRule(lb *loadBalancer, service *corev1.Service, lbRuleName string, port corev1.ServicePort, protocol LoadBalancerProtocol, desired map[string]bool) error {
+	if _, ok := lb.rules[lbRuleName]; ok {
+		return nil
+	}
+
+	old := lb.findRuleForPort(lbRuleName, port, protocol, desired)
+	if old == nil {
+		return nil
+	}
+
+	// The firewall rules are not changed, but fetch them again in case CloudStack changed them.
+	defer clear(lb.firewallRules)
+
+	if old.Privateport != strconv.Itoa(int(port.NodePort)) {
+		klog.Infof("Deleting load balancer rule %v, because it is replaced by %v with another node port", old.Name, lbRuleName)
+
+		return lb.deleteLoadBalancerRule(old)
+	}
+
+	if err := lb.renameLoadBalancerRule(old, lbRuleName, protocol); err != nil {
+		return err
+	}
+
+	msg := fmt.Sprintf("Updated load balancer rule %s to %s with protocol %s", old.Name, lbRuleName, protocol.CSProtocol())
+	cs.eventRecorder.Event(service, corev1.EventTypeNormal, "UpdatedLoadBalancerRule", msg)
+	klog.Info(msg)
+
+	return nil
+}
+
+// renameLoadBalancerRule updates the name, protocol and algorithm of an existing load balancer rule.
+func (lb *loadBalancer) renameLoadBalancerRule(old *cloudstack.LoadBalancerRule, lbRuleName string, protocol LoadBalancerProtocol) error {
+	p := lb.LoadBalancer.NewUpdateLoadBalancerRuleParams(old.Id)
+	p.SetName(lbRuleName)
+	p.SetAlgorithm(lb.algorithm)
+	p.SetProtocol(protocol.CSProtocol())
+
+	if _, err := lb.LoadBalancer.UpdateLoadBalancerRule(p); err != nil {
+		return fmt.Errorf("failed to update load balancer rule %v to %v: %w", old.Name, lbRuleName, err)
+	}
+
+	renamed := *old
+	renamed.Name = lbRuleName
+	renamed.Algorithm = lb.algorithm
+	renamed.Protocol = protocol.CSProtocol()
+	delete(lb.rules, old.Name)
+	lb.rules[lbRuleName] = &renamed
 
 	return nil
 }
@@ -1017,6 +1339,7 @@ func (lb *loadBalancer) deleteLoadBalancerRule(lbRule *cloudstack.LoadBalancerRu
 
 	// Delete the rule from the map as it no longer exists
 	delete(lb.rules, lbRule.Name)
+	lb.pendingJobs.delete(lbRule.Id)
 
 	return nil
 }
@@ -1024,7 +1347,21 @@ func (lb *loadBalancer) deleteLoadBalancerRule(lbRule *cloudstack.LoadBalancerRu
 // reconcileHostsForRule ensures the load balancer rule has exactly the expected set of hosts.
 // It lists the current members, computes the difference, and assigns new hosts before removing
 // old ones so the rule always has backends during rolling upgrades.
+//
+// If an earlier assign or remove job for the rule is still running, it returns an error that wraps errJobPending
+// and changes nothing, so the same job is not sent again.
 func (lb *loadBalancer) reconcileHostsForRule(lbRule *cloudstack.LoadBalancerRule, hostIDs []string) error {
+	if err := lb.checkPendingJob(lbRule); err != nil {
+		return err
+	}
+
+	// The node sync and the service sync can reconcile the same service at the same time. Only one of them
+	// changes a rule, so the other one does not send the same job.
+	if !lb.pendingJobs.claim(lbRule.Id) {
+		return fmt.Errorf("load balancer rule %v is being changed by another reconcile: %w", lbRule.Name, errJobPending)
+	}
+	defer lb.pendingJobs.release(lbRule.Id)
+
 	p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
 
 	l, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
@@ -1059,7 +1396,15 @@ func (lb *loadBalancer) assignHostsToRule(lbRule *cloudstack.LoadBalancerRule, h
 	p := lb.LoadBalancer.NewAssignToLoadBalancerRuleParams(lbRule.Id)
 	p.SetVirtualmachineids(hostIDs)
 
-	if _, err := lb.LoadBalancer.AssignToLoadBalancerRule(p); err != nil {
+	if r, err := lb.LoadBalancer.AssignToLoadBalancerRule(p); err != nil {
+		var jobID string
+		if r != nil {
+			jobID = r.JobID
+		}
+		if perr := lb.trackTimedOutJob(lbRule, "assign", jobID, hostIDs, err); perr != nil {
+			return perr
+		}
+
 		return fmt.Errorf("error assigning hosts to load balancer rule %v: %w", lbRule.Name, err)
 	}
 
@@ -1071,7 +1416,15 @@ func (lb *loadBalancer) removeHostsFromRule(lbRule *cloudstack.LoadBalancerRule,
 	p := lb.LoadBalancer.NewRemoveFromLoadBalancerRuleParams(lbRule.Id)
 	p.SetVirtualmachineids(hostIDs)
 
-	if _, err := lb.LoadBalancer.RemoveFromLoadBalancerRule(p); err != nil {
+	if r, err := lb.LoadBalancer.RemoveFromLoadBalancerRule(p); err != nil {
+		var jobID string
+		if r != nil {
+			jobID = r.JobID
+		}
+		if perr := lb.trackTimedOutJob(lbRule, "remove", jobID, hostIDs, err); perr != nil {
+			return perr
+		}
+
 		return fmt.Errorf("error removing hosts from load balancer rule %v: %w", lbRule.Name, err)
 	}
 
@@ -1225,11 +1578,22 @@ func rulesMapToString(rules map[*cloudstack.FirewallRule]bool) string {
 //
 // Returns true if the firewall rule was created or updated.
 func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
-	// Default to allow-all if no allowed CIDRs are defined.
-	if len(allowedCIDRs) == 0 {
-		allowedCIDRs = []string{defaultAllowedCIDR}
+	rules, ok := lb.firewallRules[publicIPID]
+	if !ok {
+		var err error
+		if rules, err = lb.listFirewallRules(publicIPID); err != nil {
+			return false, err
+		}
+		if lb.firewallRules != nil {
+			lb.firewallRules[publicIPID] = rules
+		}
 	}
 
+	return lb.reconcileFirewallRule(rules, publicIPID, publicPort, protocol, allowedCIDRs)
+}
+
+// listFirewallRules returns the firewall rules of a public IP.
+func (lb *loadBalancer) listFirewallRules(publicIPID string) ([]*cloudstack.FirewallRule, error) {
 	p := lb.Firewall.NewListFirewallRulesParams()
 	p.SetIpaddressid(publicIPID)
 	p.SetListall(true)
@@ -1238,14 +1602,29 @@ func (lb *loadBalancer) updateFirewallRule(publicIPID string, publicPort int, pr
 	}
 	r, err := lb.Firewall.ListFirewallRules(p)
 	if err != nil {
-		return false, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
+		return nil, fmt.Errorf("error fetching firewall rules for public IP %v: %w", publicIPID, err)
 	}
 	klog.V(4).Infof("Existing firewall rules for %v: %v", lb.ipAddr, rulesToString(r.FirewallRules))
+
+	return r.FirewallRules, nil
+}
+
+// reconcileFirewallRule creates or updates the firewall rule for a protocol and port, using the given existing
+// firewall rules of the public IP.
+//
+// Returns true if the firewall rule was created or updated.
+func (lb *loadBalancer) reconcileFirewallRule(existing []*cloudstack.FirewallRule, publicIPID string, publicPort int, protocol LoadBalancerProtocol, allowedCIDRs []string) (bool, error) {
+	var err error
+
+	// Default to allow-all if no allowed CIDRs are defined.
+	if len(allowedCIDRs) == 0 {
+		allowedCIDRs = []string{defaultAllowedCIDR}
+	}
 
 	// find all rules that have a matching proto+port
 	// a map may or may not be faster, but is a bit easier to understand
 	filtered := make(map[*cloudstack.FirewallRule]bool)
-	for _, rule := range r.FirewallRules {
+	for _, rule := range existing {
 		if rule.Protocol == protocol.IPProtocol() && rule.Startport == publicPort && rule.Endport == publicPort {
 			filtered[rule] = true
 		}

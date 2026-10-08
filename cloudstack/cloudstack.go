@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	"gopkg.in/gcfg.v1"
@@ -32,6 +34,7 @@ import (
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/klog/v2"
 )
 
 // CSConfig wraps the config for the CloudStack cloud provider.
@@ -43,6 +46,16 @@ type CSConfig struct {
 		SSLNoVerify bool   `gcfg:"ssl-no-verify"`
 		ProjectID   string `gcfg:"project-id"`
 		Zone        string `gcfg:"zone"`
+
+		// APIRateLimitQPS is the maximum number of CloudStack API requests per second. 0 disables the rate limit.
+		APIRateLimitQPS *float64 `gcfg:"api-rate-limit-qps"`
+		// APIRateLimitBurst is the number of CloudStack API requests that may exceed the QPS for a short time.
+		APIRateLimitBurst *int `gcfg:"api-rate-limit-burst"`
+		// VMCacheTTL is the number of seconds that the list of virtual machines is cached for load balancer
+		// host lookups. 0 disables the cache.
+		VMCacheTTL *int `gcfg:"vm-cache-ttl"`
+		// AsyncJobTimeout is the number of seconds that the CCM waits for a CloudStack async job.
+		AsyncJobTimeout *int `gcfg:"async-job-timeout"`
 	}
 }
 
@@ -59,6 +72,8 @@ type CSCloud struct {
 	zone          string
 	kclient       kubernetes.Interface
 	eventRecorder record.EventRecorder
+	vmCache       *vmCache     // nil disables the cache
+	pendingJobs   *pendingJobs // nil disables the tracking of running jobs
 }
 
 func init() {
@@ -88,18 +103,69 @@ func readConfig(config io.Reader) (*CSConfig, error) {
 
 // newCSCloud creates a new instance of CSCloud.
 func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
+	qps := defaultAPIRateLimitQPS
+	if cfg.Global.APIRateLimitQPS != nil {
+		qps = *cfg.Global.APIRateLimitQPS
+		if qps < 0 || math.IsNaN(qps) {
+			return nil, fmt.Errorf("invalid cloud provider configuration: api-rate-limit-qps must not be negative, got %v", qps)
+		}
+	}
+
+	burst := defaultAPIRateLimitBurst
+	if cfg.Global.APIRateLimitBurst != nil {
+		burst = *cfg.Global.APIRateLimitBurst
+	}
+	if qps > 0 && burst < 1 {
+		return nil, fmt.Errorf("invalid cloud provider configuration: api-rate-limit-burst must be at least 1, got %d", burst)
+	}
+
+	vmCacheTTL := defaultVMCacheTTL
+	if cfg.Global.VMCacheTTL != nil {
+		if *cfg.Global.VMCacheTTL < 0 {
+			return nil, fmt.Errorf("invalid cloud provider configuration: vm-cache-ttl must not be negative, got %d", *cfg.Global.VMCacheTTL)
+		}
+		vmCacheTTL = time.Duration(*cfg.Global.VMCacheTTL) * time.Second
+	}
+
+	asyncJobTimeout := defaultAsyncJobTimeout
+	if cfg.Global.AsyncJobTimeout != nil {
+		if *cfg.Global.AsyncJobTimeout <= 0 || *cfg.Global.AsyncJobTimeout > int(maxAsyncJobTimeout/time.Second) {
+			return nil, fmt.Errorf("invalid cloud provider configuration: async-job-timeout must be between 1 and %d, got %d",
+				int(maxAsyncJobTimeout/time.Second), *cfg.Global.AsyncJobTimeout)
+		}
+		asyncJobTimeout = time.Duration(*cfg.Global.AsyncJobTimeout) * time.Second
+	}
+
 	cs := &CSCloud{
-		projectID: cfg.Global.ProjectID,
-		zone:      cfg.Global.Zone,
+		projectID:   cfg.Global.ProjectID,
+		zone:        cfg.Global.Zone,
+		vmCache:     newVMCache(vmCacheTTL),
+		pendingJobs: newPendingJobs(),
 	}
 
 	if cfg.Global.APIURL != "" && cfg.Global.APIKey != "" && cfg.Global.SecretKey != "" {
-		cs.client = cloudstack.NewAsyncClient(cfg.Global.APIURL, cfg.Global.APIKey, cfg.Global.SecretKey, !cfg.Global.SSLNoVerify)
+		cs.client = cloudstack.NewAsyncClient(cfg.Global.APIURL, cfg.Global.APIKey, cfg.Global.SecretKey, !cfg.Global.SSLNoVerify,
+			cloudstack.WithHTTPClient(newHTTPClient(cfg.Global.SSLNoVerify, qps, burst)),
+			cloudstack.WithAsyncTimeout(int64(asyncJobTimeout/time.Second)))
 	}
 
 	if cs.client == nil {
 		return nil, errors.New("cloud provider configuration incomplete: api-url, api-key, and secret-key are all required")
 	}
+
+	if qps > 0 {
+		klog.Infof("CloudStack API rate limit: %v QPS, burst %d", qps, burst)
+	} else {
+		klog.Info("CloudStack API rate limit is disabled")
+	}
+
+	if vmCacheTTL > 0 {
+		klog.Infof("CloudStack VM cache for load balancer host lookups: TTL %v", vmCacheTTL)
+	} else {
+		klog.Info("CloudStack VM cache for load balancer host lookups is disabled")
+	}
+
+	klog.Infof("CloudStack async job timeout: %v", asyncJobTimeout)
 
 	return cs, nil
 }
