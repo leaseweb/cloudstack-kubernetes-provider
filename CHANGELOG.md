@@ -1,6 +1,27 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.11.0 (2026-10-08)
+---
+
+### Features
+
+- Protect the CloudStack API from request storms at CCM startup (rate limiting, throttle backoff with Retry-After support, VM cache)
+- Do not resend LB assign/remove jobs that are still running
+- Log VM cache settings at startup and cache hits at V(4)
+
+### Bug Fixes
+
+- Switch the LB rule in place when the proxy protocol is toggled
+- Release the LB IP when deleting the rules timed out
+- Only report orphaned IPs that the CCM took over, and never NAT IPs
+- Count a node that matches a VM by its ProviderID as matched
+- Compare node creation time with the VM list fetch time in whole seconds
+
+### Maintenance
+
+- Bump Helm chart to v1.8.0 for CCM release v1.10.0
+
 v1.10.0 (2026-09-21)
 ---
 
