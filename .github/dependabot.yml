@@ -7,12 +7,17 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
-    labels:
-      - dependencies
-      - actions
     schedule:
       interval: weekly
       day: sunday
+    groups:
+      all-github-actions:
+        patterns: [ "*" ]
+    commit-message:
+      prefix: ":seedling:"
+    labels:
+      - dependencies
+      - actions
   - package-ecosystem: docker
     directory: /
     labels:
@@ -29,6 +34,16 @@ updates:
     schedule:
       interval: weekly
       day: sunday
+    ## group all dependencies into a single PR.
+    groups:
+      all-go-mod-patch-and-minor:
+        patterns: [ "*" ]
+        update-types: [ "patch", "minor" ]
+    ignore:
+    - dependency-name: "k8s.io/*"
+      update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
+      # Ignore the CloudStack Go SDK as its version is pinned and upgraded manually.
+    - dependency-name: "github.com/apache/cloudstack-go/v2"
     # Only propose updates for direct dependencies. 80 of the 92 indirect
     # requirements in go.mod are pulled in by k8s.io/*, and bumping one ahead of
     # upstream writes an explicit version into the indirect require block that
@@ -38,14 +53,5 @@ updates:
     # tab; this only stops the automated pull requests.
     allow:
       - dependency-type: "direct"
-    ignore:
-      - dependency-name: "k8s.io/api"
-        update-types: ["version-update:semver-minor"]
-      - dependency-name: "k8s.io/apimachinery"
-        update-types: ["version-update:semver-minor"]
-      - dependency-name: "k8s.io/client-go"
-        update-types: ["version-update:semver-minor"]
-      - dependency-name: "k8s.io/cloud-provider"
-        update-types: ["version-update:semver-minor"]
-      - dependency-name: "k8s.io/component-base"
-        update-types: ["version-update:semver-minor"]
+    commit-message:
+      prefix: ":seedling:"
