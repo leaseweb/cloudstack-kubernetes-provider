@@ -111,10 +111,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.3 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-replace (
-	k8s.io/apiserver => k8s.io/apiserver v0.36.4
-	k8s.io/component-helpers => k8s.io/component-helpers v0.36.4
-	k8s.io/controller-manager => k8s.io/controller-manager v0.36.4
-	k8s.io/kms => k8s.io/kms v0.36.4
-)
