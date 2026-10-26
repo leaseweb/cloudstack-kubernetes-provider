@@ -1,6 +1,13 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+Unreleased
+---
+
+### Features
+
+- feat(deps): Update K8s deps to v0.37.1 for K8s 1.37 support
+
 v1.11.0 (2026-10-08)
 ---
 
