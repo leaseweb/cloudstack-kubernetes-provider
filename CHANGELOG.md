@@ -1,6 +1,21 @@
 Apache CloudStack Kubernetes Provider Changelog
 ====
 
+v1.11.1 (2026-10-27)
+---
+
+### Dependencies
+
+- Updated K8s deps to v0.36.5
+- Bump helm/chart-testing-action from 2.8.0 to 2.9.0
+- Bump helm/kind-action from 1.15.0 to 1.15.1
+
+### Maintenance
+
+- Remove unneeded replace directives for indirect K8s deps
+- Group Dependabot updates
+- Bump Helm chart to v1.9.0 for CCM release v1.11.0
+
 v1.11.0 (2026-10-08)
 ---
 
